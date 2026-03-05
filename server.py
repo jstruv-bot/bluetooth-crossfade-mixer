@@ -3,14 +3,20 @@ Bluetooth Speaker Crossfade Mixer — Backend
 Flask API + pycaw device enumeration for per-device volume control.
 """
 
+import logging
 import webbrowser
 import threading
 from flask import Flask, render_template, jsonify, request
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger(__name__)
+
 # pycaw / COM imports for Windows Core Audio
 import comtypes
-from comtypes import CLSCTX_ALL
-from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+from pycaw.pycaw import AudioUtilities
 from pycaw.constants import EDataFlow, DEVICE_STATE
 
 # ---------------------------------------------------------------------------
@@ -51,7 +57,7 @@ def get_bluetooth_speakers():
             device_state=DEVICE_STATE.ACTIVE.value,
         )
     except Exception as exc:
-        print(f"[enumerate] Failed to list devices: {exc}")
+        log.warning("Failed to list devices: %s", exc)
         return devices_info
 
     for device in all_devices:
@@ -85,7 +91,7 @@ def get_bluetooth_speakers():
 
         except Exception as exc:
             # Individual device failure must not crash the scan.
-            print(f"[enumerate] Skipping device: {exc}")
+            log.debug("Skipping device: %s", exc)
             continue
 
     return devices_info
@@ -110,25 +116,34 @@ def set_device_volume(device_id, volume):
     volume = max(0.0, min(1.0, float(volume)))
 
     try:
-        all_devices = AudioUtilities.GetAllDevices()
+        all_devices = AudioUtilities.GetAllDevices(
+            data_flow=EDataFlow.eRender.value,
+            device_state=DEVICE_STATE.ACTIVE.value,
+        )
     except Exception as exc:
-        print(f"[set_volume] Failed to enumerate devices: {exc}")
+        log.warning("Failed to enumerate devices: %s", exc)
         return False
 
     for device in all_devices:
         try:
-            if device.id == device_id:
-                endpoint_volume = device.EndpointVolume
-                if endpoint_volume is None:
-                    print(f"[set_volume] Device has no volume interface: {device_id}")
-                    return False
-                endpoint_volume.SetMasterVolumeLevelScalar(volume, None)
-                return True
+            if device.id != device_id:
+                continue
+        except Exception:
+            continue
+
+        # Found the target device — try to set volume.
+        try:
+            endpoint_volume = device.EndpointVolume
+            if endpoint_volume is None:
+                log.warning("Device has no volume interface: %s", device_id)
+                return False
+            endpoint_volume.SetMasterVolumeLevelScalar(volume, None)
+            return True
         except Exception as exc:
-            print(f"[set_volume] Error setting volume on {device_id}: {exc}")
+            log.error("Error setting volume on %s: %s", device_id, exc)
             return False
 
-    print(f"[set_volume] Device not found: {device_id}")
+    log.warning("Device not found: %s", device_id)
     return False
 
 
@@ -144,6 +159,7 @@ def index():
 
 
 @app.route("/api/devices", methods=["GET"])
+@app.route("/api/refresh", methods=["POST"])
 def api_devices():
     """Return the current list of active playback devices as JSON."""
     devices = get_bluetooth_speakers()
@@ -181,13 +197,6 @@ def api_volume():
         return jsonify({"success": False, "error": "Failed to set volume"}), 500
 
 
-@app.route("/api/refresh", methods=["POST"])
-def api_refresh():
-    """Re-scan devices and return the updated list."""
-    devices = get_bluetooth_speakers()
-    return jsonify(devices)
-
-
 # ---------------------------------------------------------------------------
 # Application entry point
 # ---------------------------------------------------------------------------
@@ -197,8 +206,8 @@ if __name__ == "__main__":
     PORT = 5123
     url = f"http://{HOST}:{PORT}"
 
-    print(f"Starting Bluetooth Crossfade Mixer server at {url}")
-    print("Press Ctrl+C to stop.\n")
+    log.info("Starting Bluetooth Crossfade Mixer server at %s", url)
+    log.info("Press Ctrl+C to stop.")
 
     # Open the browser after a short delay so the server is ready.
     threading.Timer(1.5, lambda: webbrowser.open(url)).start()
