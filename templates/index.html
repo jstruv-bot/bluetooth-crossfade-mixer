@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bluetooth Crossfade Mixer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #1a1a2e;
+    color: #e0e0e0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-height: 100vh;
+    padding: 24px 16px;
+  }
+
+  h1 {
+    font-size: 1.6rem;
+    font-weight: 600;
+    margin-bottom: 6px;
+    color: #ffffff;
+  }
+
+  .subtitle {
+    font-size: 0.85rem;
+    color: #888;
+    margin-bottom: 20px;
+  }
+
+  canvas {
+    border-radius: 50%;
+    box-shadow: 0 0 40px rgba(0, 212, 255, 0.08);
+    cursor: default;
+    touch-action: none;
+  }
+
+  .controls {
+    margin-top: 16px;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+  }
+
+  button {
+    background: #16213e;
+    color: #e0e0e0;
+    border: 1px solid #0f3460;
+    border-radius: 6px;
+    padding: 8px 18px;
+    font-size: 0.85rem;
+    cursor: pointer;
+    transition: background 0.2s, border-color 0.2s;
+  }
+
+  button:hover {
+    background: #0f3460;
+    border-color: #00d4ff;
+  }
+
+  button:active { transform: scale(0.97); }
+
+  .status-bar {
+    margin-top: 10px;
+    font-size: 0.78rem;
+    color: #666;
+    text-align: center;
+    min-height: 1.2em;
+  }
+
+  .status-bar.error { color: #ff6b6b; }
+
+  details {
+    margin-top: 24px;
+    max-width: 500px;
+    width: 100%;
+    background: #16213e;
+    border: 1px solid #0f3460;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  summary {
+    padding: 12px 16px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    font-weight: 500;
+    color: #aaa;
+    user-select: none;
+  }
+
+  summary:hover { color: #e0e0e0; }
+
+  .guide-content {
+    padding: 0 16px 16px;
+    font-size: 0.82rem;
+    line-height: 1.6;
+    color: #999;
+  }
+
+  .guide-content h3 {
+    color: #ccc;
+    font-size: 0.88rem;
+    margin: 12px 0 6px;
+  }
+
+  .guide-content ol, .guide-content ul {
+    padding-left: 20px;
+  }
+
+  .guide-content li { margin-bottom: 4px; }
+  .guide-content code { color: #00d4ff; font-size: 0.82rem; }
+</style>
+</head>
+<body>
+
+<h1>Bluetooth Crossfade Mixer</h1>
+<p class="subtitle">Drag the control point to blend volume between speakers</p>
+
+<canvas id="mixer" width="500" height="500"></canvas>
+
+<div class="controls">
+  <button id="btnRefresh">Refresh Devices</button>
+</div>
+
+<div id="statusBar" class="status-bar">Connecting...</div>
+
+<details>
+  <summary>Setup Guide &mdash; Multi-Output Audio on Windows</summary>
+  <div class="guide-content">
+    <p>Windows only routes audio to one output by default. To send audio to multiple speakers simultaneously, use one of these methods:</p>
+
+    <h3>Method 1: Stereo Mix (Built-in)</h3>
+    <ol>
+      <li>Right-click the speaker icon in the taskbar &rarr; <code>Sounds</code></li>
+      <li>Go to the <code>Recording</code> tab</li>
+      <li>Right-click and enable <code>Show Disabled Devices</code></li>
+      <li>Enable <code>Stereo Mix</code></li>
+      <li>Right-click Stereo Mix &rarr; <code>Properties</code> &rarr; <code>Listen</code> tab</li>
+      <li>Check <code>Listen to this device</code> and select your secondary speaker</li>
+      <li>Click Apply &mdash; audio now plays on both outputs</li>
+    </ol>
+
+    <h3>Method 2: Voicemeeter (Third-Party)</h3>
+    <ol>
+      <li>Download and install <code>Voicemeeter</code> (free)</li>
+      <li>Set Voicemeeter as your default playback device</li>
+      <li>In Voicemeeter, assign multiple hardware outputs (A1, A2, etc.) to your Bluetooth speakers</li>
+      <li>Audio is now routed to all assigned outputs</li>
+    </ol>
+
+    <p>Once multi-output is configured, this mixer controls the volume balance between your speakers.</p>
+  </div>
+</details>
+
+<script>
+(function () {
+  "use strict";
+
+  // -----------------------------------------------------------------------
+  // State
+  // -----------------------------------------------------------------------
+  const canvas = document.getElementById("mixer");
+  const ctx = canvas.getContext("2d");
+  const CX = canvas.width / 2;
+  const CY = canvas.height / 2;
+  const RING_RADIUS = 190;
+  const NODE_RADIUS = 28;
+  const CP_RADIUS = 16;
+  const EPSILON = 400; // prevents div-by-zero in inverse-square weighting
+
+  const state = {
+    devices: [],           // [{id, name, volume, x, y, displayVol}]
+    cp: { x: CX, y: CY }, // control point
+    isDragging: false,
+    connected: false,
+    lastError: null,
+    lastSentVolumes: {},   // device_id -> last volume sent (for throttling)
+  };
+
+  const statusBar = document.getElementById("statusBar");
+
+  // -----------------------------------------------------------------------
+  // Device fetching
+  // -----------------------------------------------------------------------
+
+  async function fetchDevices() {
+    try {
+      const res = await fetch("/api/devices");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const devices = await res.json();
+
+      // Lay out devices evenly on the ring
+      const n = devices.length;
+      devices.forEach((d, i) => {
+        const angle = (i * 2 * Math.PI) / n - Math.PI / 2; // start at top
+        d.x = CX + RING_RADIUS * Math.cos(angle);
+        d.y = CY + RING_RADIUS * Math.sin(angle);
+        // Preserve smooth display volume from prior frame if device existed
+        const prev = state.devices.find(p => p.id === d.id);
+        d.displayVol = prev ? prev.displayVol : (d.volume ?? 0);
+      });
+
+      state.devices = devices;
+      state.connected = true;
+      state.lastError = null;
+      updateStatus();
+    } catch (err) {
+      state.connected = false;
+      state.lastError = "Connection lost — retrying...";
+      updateStatus();
+    }
+  }
+
+  function updateStatus() {
+    if (!state.connected) {
+      statusBar.textContent = state.lastError || "Disconnected";
+      statusBar.className = "status-bar error";
+    } else {
+      const n = state.devices.length;
+      statusBar.textContent = n > 0
+        ? `${n} device${n !== 1 ? "s" : ""} connected`
+        : "No speakers detected";
+      statusBar.className = "status-bar";
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Volume calculation & sending
+  // -----------------------------------------------------------------------
+
+  function computeVolumes() {
+    if (state.devices.length === 0) return;
+
+    const weights = state.devices.map(d => {
+      const dx = state.cp.x - d.x;
+      const dy = state.cp.y - d.y;
+      const distSq = dx * dx + dy * dy;
+      return 1 / (distSq + EPSILON);
+    });
+
+    const maxW = Math.max(...weights);
+
+    state.devices.forEach((d, i) => {
+      const normalized = maxW > 0 ? weights[i] / maxW : 0;
+      d.targetVol = normalized < 0.02 ? 0 : normalized;
+    });
+  }
+
+  async function sendVolumes() {
+    const toSend = [];
+    for (const d of state.devices) {
+      const target = d.targetVol ?? d.volume ?? 0;
+      const lastSent = state.lastSentVolumes[d.id];
+      // Only send if changed by more than 1%
+      if (lastSent === undefined || Math.abs(target - lastSent) > 0.01) {
+        toSend.push({ device_id: d.id, volume: Math.round(target * 1000) / 1000 });
+        state.lastSentVolumes[d.id] = target;
+      }
+    }
+
+    if (toSend.length === 0) return;
+
+    try {
+      await fetch("/api/volume/batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ volumes: toSend }),
+      });
+    } catch {
+      // Volume send failure is non-critical — next frame will retry
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Drawing
+  // -----------------------------------------------------------------------
+
+  function lerp(a, b, t) { return a + (b - a) * t; }
+
+  function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Background ring
+    ctx.beginPath();
+    ctx.arc(CX, CY, RING_RADIUS + 30, 0, Math.PI * 2);
+    ctx.strokeStyle = "rgba(255,255,255,0.04)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(CX, CY, RING_RADIUS, 0, Math.PI * 2);
+    ctx.strokeStyle = "rgba(255,255,255,0.08)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    if (state.devices.length === 0) {
+      ctx.fillStyle = "#555";
+      ctx.font = "16px sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText("No speakers detected", CX, CY);
+      requestAnimationFrame(draw);
+      return;
+    }
+
+    // Connection lines from control point to each device
+    for (const d of state.devices) {
+      const vol = d.displayVol ?? 0;
+      if (vol < 0.01) continue;
+
+      ctx.beginPath();
+      ctx.moveTo(state.cp.x, state.cp.y);
+      ctx.lineTo(d.x, d.y);
+      ctx.strokeStyle = `rgba(0, 212, 255, ${vol * 0.35})`;
+      ctx.lineWidth = 1 + vol * 2;
+      ctx.stroke();
+    }
+
+    // Device nodes
+    for (const d of state.devices) {
+      const target = d.targetVol ?? d.volume ?? 0;
+      d.displayVol = lerp(d.displayVol ?? 0, target, 0.15);
+      const vol = d.displayVol;
+
+      // Glow
+      if (vol > 0.01) {
+        const grad = ctx.createRadialGradient(d.x, d.y, NODE_RADIUS * 0.5, d.x, d.y, NODE_RADIUS * 2 + vol * 20);
+        grad.addColorStop(0, `rgba(0, 212, 255, ${vol * 0.4})`);
+        grad.addColorStop(1, "rgba(0, 212, 255, 0)");
+        ctx.beginPath();
+        ctx.arc(d.x, d.y, NODE_RADIUS * 2 + vol * 20, 0, Math.PI * 2);
+        ctx.fillStyle = grad;
+        ctx.fill();
+      }
+
+      // Node circle
+      ctx.beginPath();
+      ctx.arc(d.x, d.y, NODE_RADIUS, 0, Math.PI * 2);
+      const brightness = 30 + vol * 40;
+      ctx.fillStyle = `hsl(195, 80%, ${brightness}%)`;
+      ctx.fill();
+      ctx.strokeStyle = vol > 0.01 ? `rgba(0, 212, 255, ${0.4 + vol * 0.6})` : "rgba(255,255,255,0.15)";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // Volume percentage inside node
+      ctx.fillStyle = "#fff";
+      ctx.font = "bold 13px sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(`${Math.round(vol * 100)}%`, d.x, d.y);
+
+      // Device name below node
+      ctx.fillStyle = "#aaa";
+      ctx.font = "11px sans-serif";
+      ctx.textAlign = "center";
+      const name = d.name.length > 20 ? d.name.slice(0, 18) + "..." : d.name;
+      ctx.fillText(name, d.x, d.y + NODE_RADIUS + 14);
+    }
+
+    // Control point
+    const cpGrad = ctx.createRadialGradient(state.cp.x, state.cp.y, 2, state.cp.x, state.cp.y, CP_RADIUS);
+    cpGrad.addColorStop(0, "#ffffff");
+    cpGrad.addColorStop(1, "rgba(255, 140, 50, 0.9)");
+    ctx.beginPath();
+    ctx.arc(state.cp.x, state.cp.y, CP_RADIUS, 0, Math.PI * 2);
+    ctx.fillStyle = cpGrad;
+    ctx.fill();
+    ctx.strokeStyle = "#ff8c32";
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+
+    // Small crosshair inside control point
+    ctx.strokeStyle = "rgba(0,0,0,0.3)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(state.cp.x - 5, state.cp.y);
+    ctx.lineTo(state.cp.x + 5, state.cp.y);
+    ctx.moveTo(state.cp.x, state.cp.y - 5);
+    ctx.lineTo(state.cp.x, state.cp.y + 5);
+    ctx.stroke();
+
+    requestAnimationFrame(draw);
+  }
+
+  // -----------------------------------------------------------------------
+  // Interaction
+  // -----------------------------------------------------------------------
+
+  function getPointerPos(e) {
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    return {
+      x: (clientX - rect.left) * scaleX,
+      y: (clientY - rect.top) * scaleY,
+    };
+  }
+
+  function isNearCP(pos) {
+    const dx = pos.x - state.cp.x;
+    const dy = pos.y - state.cp.y;
+    return dx * dx + dy * dy <= (CP_RADIUS + 10) * (CP_RADIUS + 10);
+  }
+
+  function clampToRing(x, y) {
+    const dx = x - CX;
+    const dy = y - CY;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const maxDist = RING_RADIUS - 5;
+    if (dist > maxDist) {
+      return { x: CX + (dx / dist) * maxDist, y: CY + (dy / dist) * maxDist };
+    }
+    return { x, y };
+  }
+
+  canvas.addEventListener("mousedown", (e) => {
+    const pos = getPointerPos(e);
+    if (isNearCP(pos)) {
+      state.isDragging = true;
+      canvas.style.cursor = "grabbing";
+    }
+  });
+
+  canvas.addEventListener("mousemove", (e) => {
+    const pos = getPointerPos(e);
+    if (state.isDragging) {
+      const clamped = clampToRing(pos.x, pos.y);
+      state.cp.x = clamped.x;
+      state.cp.y = clamped.y;
+      computeVolumes();
+    } else {
+      canvas.style.cursor = isNearCP(pos) ? "grab" : "default";
+    }
+  });
+
+  canvas.addEventListener("mouseup", () => {
+    state.isDragging = false;
+    canvas.style.cursor = "default";
+  });
+
+  canvas.addEventListener("mouseleave", () => {
+    state.isDragging = false;
+    canvas.style.cursor = "default";
+  });
+
+  // Touch support
+  canvas.addEventListener("touchstart", (e) => {
+    const pos = getPointerPos(e);
+    if (isNearCP(pos)) {
+      state.isDragging = true;
+      e.preventDefault();
+    }
+  }, { passive: false });
+
+  canvas.addEventListener("touchmove", (e) => {
+    if (state.isDragging) {
+      e.preventDefault();
+      const pos = getPointerPos(e);
+      const clamped = clampToRing(pos.x, pos.y);
+      state.cp.x = clamped.x;
+      state.cp.y = clamped.y;
+      computeVolumes();
+    }
+  }, { passive: false });
+
+  canvas.addEventListener("touchend", () => { state.isDragging = false; });
+
+  // -----------------------------------------------------------------------
+  // Refresh button
+  // -----------------------------------------------------------------------
+
+  document.getElementById("btnRefresh").addEventListener("click", async () => {
+    try {
+      const res = await fetch("/api/refresh", { method: "POST" });
+      if (res.ok) await fetchDevices();
+    } catch { /* ignore */ }
+  });
+
+  // -----------------------------------------------------------------------
+  // Main loop
+  // -----------------------------------------------------------------------
+
+  // Send volume updates at ~30fps while dragging
+  let volumeInterval = setInterval(() => {
+    if (state.isDragging) sendVolumes();
+  }, 33);
+
+  // Also send final volumes when drag ends
+  canvas.addEventListener("mouseup", () => sendVolumes());
+  canvas.addEventListener("touchend", () => sendVolumes());
+
+  // Poll devices every 5 seconds
+  fetchDevices();
+  setInterval(fetchDevices, 5000);
+
+  // Start render loop
+  requestAnimationFrame(draw);
+})();
+</script>
+</body>
+</html>
