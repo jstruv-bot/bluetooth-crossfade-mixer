@@ -7,7 +7,6 @@ Features: crossfade curves, mute, presets, groups, WebSocket, EQ, auto-reconnect
 import logging
 import webbrowser
 import threading
-import json
 import os
 from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO, emit
@@ -42,8 +41,6 @@ _com_initialized = threading.local()
 # Maximum length for device_id strings to prevent abuse
 _MAX_DEVICE_ID_LEN = 512
 _MAX_GROUP_NAME_LEN = 64
-_MAX_PRESET_NAME_LEN = 64
-_MAX_PRESETS = 20
 _MAX_GROUPS = 20
 
 # Muted devices: set of device_id
@@ -106,6 +103,18 @@ def get_playback_devices():
 
     current_ids = set()
 
+    # Snapshot shared state once to avoid per-device lock contention
+    with _muted_lock:
+        muted_snapshot = set(_muted_devices)
+    with _eq_lock:
+        eq_snapshot = dict(_device_eq)
+    with _groups_lock:
+        # Build reverse lookup: device_id -> group_name
+        device_to_group = {}
+        for gname, members in _device_groups.items():
+            for mid in members:
+                device_to_group[mid] = gname
+
     for device in all_devices:
         try:
             friendly_name = device.FriendlyName
@@ -123,27 +132,13 @@ def get_playback_devices():
             except Exception:
                 pass
 
-            with _muted_lock:
-                is_muted = device_id in _muted_devices
-
-            with _eq_lock:
-                eq = _device_eq.get(device_id, {"bass": 0.0, "treble": 0.0})
-
-            # Find which group this device belongs to
-            group_name = None
-            with _groups_lock:
-                for gname, members in _device_groups.items():
-                    if device_id in members:
-                        group_name = gname
-                        break
-
             devices_info.append({
                 "id": device_id,
                 "name": friendly_name,
                 "volume": round(volume_level, 4) if volume_level is not None else None,
-                "muted": is_muted,
-                "group": group_name,
-                "eq": eq,
+                "muted": device_id in muted_snapshot,
+                "group": device_to_group.get(device_id),
+                "eq": eq_snapshot.get(device_id, {"bass": 0.0, "treble": 0.0}),
             })
 
         except Exception as exc:
@@ -248,6 +243,7 @@ def set_volumes_batch(volumes):
         log.error("Failed to enumerate devices: %s", exc)
         return {did: False for did in lookup}
 
+    successfully_set = {}
     for device in all_devices:
         try:
             if device.id in lookup:
@@ -257,12 +253,15 @@ def set_volumes_batch(volumes):
                 else:
                     endpoint_volume.SetMasterVolumeLevelScalar(lookup[device.id], None)
                     results[device.id] = True
-                    # Remember volume for auto-reconnect
-                    with _volumes_lock:
-                        _last_volumes[device.id] = lookup[device.id]
+                    successfully_set[device.id] = lookup[device.id]
         except Exception as exc:
             log.error("Error setting volume on %s: %s", device.id, exc)
             results[device.id] = False
+
+    # Batch-update remembered volumes for auto-reconnect
+    if successfully_set:
+        with _volumes_lock:
+            _last_volumes.update(successfully_set)
 
     for did in lookup:
         if did not in results:
@@ -426,7 +425,7 @@ def api_groups_create():
 
     for did in device_ids:
         if not _validate_device_id(did):
-            return jsonify({"success": False, "error": f"Invalid device_id in group"}), 400
+            return jsonify({"success": False, "error": "Invalid device_id in group"}), 400
 
     name = name.strip()
 
@@ -440,9 +439,10 @@ def api_groups_create():
                 del _device_groups[gname]
         if device_ids:
             _device_groups[name] = device_ids
+        groups_copy = dict(_device_groups)
 
-    socketio.emit("groups_updated", _device_groups)
-    return jsonify({"success": True, "groups": _device_groups})
+    socketio.emit("groups_updated", groups_copy)
+    return jsonify({"success": True, "groups": groups_copy})
 
 
 @app.route("/api/groups/<name>", methods=["DELETE"])
@@ -451,7 +451,8 @@ def api_groups_delete(name):
     with _groups_lock:
         if name in _device_groups:
             del _device_groups[name]
-    socketio.emit("groups_updated", _device_groups)
+        groups_copy = dict(_device_groups)
+    socketio.emit("groups_updated", groups_copy)
     return jsonify({"success": True})
 
 
@@ -552,15 +553,23 @@ def ws_set_volumes_batch(data):
 _monitor_interval = 3.0  # seconds
 
 
+def _device_snapshot_key(devices):
+    """Return a lightweight hashable key for change detection."""
+    return tuple(
+        (d["id"], d["name"], d["volume"], d["muted"], d["group"])
+        for d in devices
+    )
+
+
 def _device_monitor():
     """Periodically check for device changes and push updates via WebSocket."""
-    prev_snapshot = None
+    prev_key = None
     while True:
         try:
             devices = get_playback_devices()
-            snapshot = json.dumps(devices, sort_keys=True)
-            if snapshot != prev_snapshot:
-                prev_snapshot = snapshot
+            key = _device_snapshot_key(devices)
+            if key != prev_key:
+                prev_key = key
                 socketio.emit("devices_updated", devices)
         except Exception as exc:
             log.error("Device monitor error: %s", exc)

@@ -335,7 +335,6 @@
   };
 
   const statusBar = document.getElementById("statusBar");
-  const wsIndicator = document.getElementById("wsIndicator");
   const ariaLive = document.getElementById("ariaLive");
 
   // -----------------------------------------------------------------------
@@ -356,12 +355,17 @@
     });
 
     socket.on("devices_updated", (devices) => {
+      const prevIds = state.devices.map(d => d.id).join(",");
       layoutDevices(devices);
       state.connected = true;
       state.lastError = null;
       updateStatus();
-      renderEQPanel();
-      renderGroupDeviceChecklist();
+      // Only re-render panels if the device list changed (avoids losing user state)
+      const newIds = devices.map(d => d.id).join(",");
+      if (prevIds !== newIds) {
+        renderEQPanel();
+        renderGroupDeviceChecklist();
+      }
     });
 
     socket.on("groups_updated", (groups) => {
@@ -402,14 +406,15 @@
   // -----------------------------------------------------------------------
   function layoutDevices(devices) {
     const n = devices.length;
+    // Build lookup map from previous devices for O(1) access
+    const prevMap = new Map(state.devices.map(p => [p.id, p]));
     devices.forEach((d, i) => {
       const angle = (i * 2 * Math.PI) / n - Math.PI / 2;
       d.x = CX + RING_RADIUS * Math.cos(angle);
       d.y = CY + RING_RADIUS * Math.sin(angle);
-      const prev = state.devices.find(p => p.id === d.id);
+      const prev = prevMap.get(d.id);
       d.displayVol = prev ? prev.displayVol : (d.volume ?? 0);
       d.targetVol = prev ? prev.targetVol : (d.volume ?? 0);
-      // Preserve mute state from server
       if (d.muted) state.mutedDevices.add(d.id);
     });
     state.devices = devices;
@@ -423,12 +428,16 @@
       const res = await fetch("/api/devices");
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const devices = await res.json();
+      const prevIds = state.devices.map(d => d.id).join(",");
       layoutDevices(devices);
       state.connected = true;
       state.lastError = null;
       updateStatus();
-      renderEQPanel();
-      renderGroupDeviceChecklist();
+      const newIds = devices.map(d => d.id).join(",");
+      if (prevIds !== newIds) {
+        renderEQPanel();
+        renderGroupDeviceChecklist();
+      }
     } catch {
       state.connected = false;
       state.lastError = "Connection lost \u2014 retrying...";
@@ -586,9 +595,8 @@
         drawnGroups.add(d.group);
         const members = state.devices.filter(m => m.group === d.group);
         if (members.length >= 2) {
-          const groupColor = stringToColor(d.group);
           ctx.beginPath();
-          ctx.strokeStyle = groupColor + "40";
+          ctx.strokeStyle = stringToColor(d.group, 0.25);
           ctx.lineWidth = 3;
           for (let i = 0; i < members.length; i++) {
             const m = members[i];
@@ -717,10 +725,11 @@
     requestAnimationFrame(draw);
   }
 
-  function stringToColor(str) {
+  function stringToColor(str, alpha) {
     let hash = 0;
     for (let i = 0; i < str.length; i++) hash = str.charCodeAt(i) + ((hash << 5) - hash);
     const h = Math.abs(hash) % 360;
+    if (alpha !== undefined) return `hsla(${h}, 70%, 60%, ${alpha})`;
     return `hsl(${h}, 70%, 60%)`;
   }
 
