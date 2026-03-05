@@ -18,65 +18,77 @@
     padding: 24px 16px;
   }
 
-  h1 {
-    font-size: 1.6rem;
-    font-weight: 600;
-    margin-bottom: 6px;
-    color: #ffffff;
-  }
+  h1 { font-size: 1.6rem; font-weight: 600; margin-bottom: 6px; color: #fff; }
+  .subtitle { font-size: 0.85rem; color: #888; margin-bottom: 16px; }
 
-  .subtitle {
-    font-size: 0.85rem;
-    color: #888;
-    margin-bottom: 20px;
-  }
-
+  /* Mixer canvas */
   canvas {
     border-radius: 50%;
     box-shadow: 0 0 40px rgba(0, 212, 255, 0.08);
     cursor: default;
     touch-action: none;
+    outline: none;
   }
+  canvas:focus { box-shadow: 0 0 40px rgba(0, 212, 255, 0.2), 0 0 0 2px #00d4ff; }
 
-  .controls {
-    margin-top: 16px;
+  /* Controls toolbar */
+  .toolbar {
+    margin-top: 14px;
     display: flex;
-    gap: 10px;
+    gap: 8px;
     align-items: center;
+    flex-wrap: wrap;
+    justify-content: center;
+    max-width: 560px;
   }
 
-  button {
+  button, select {
     background: #16213e;
     color: #e0e0e0;
     border: 1px solid #0f3460;
     border-radius: 6px;
-    padding: 8px 18px;
-    font-size: 0.85rem;
+    padding: 7px 14px;
+    font-size: 0.82rem;
     cursor: pointer;
     transition: background 0.2s, border-color 0.2s;
   }
-
-  button:hover {
-    background: #0f3460;
-    border-color: #00d4ff;
-  }
-
+  button:hover, select:hover { background: #0f3460; border-color: #00d4ff; }
   button:active { transform: scale(0.97); }
+  button.active { background: #0f3460; border-color: #00d4ff; color: #00d4ff; }
+  select { padding: 7px 8px; }
 
   .status-bar {
-    margin-top: 10px;
-    font-size: 0.78rem;
+    margin-top: 8px;
+    font-size: 0.76rem;
     color: #666;
     text-align: center;
     min-height: 1.2em;
   }
-
   .status-bar.error { color: #ff6b6b; }
+  .status-bar .ws-indicator {
+    display: inline-block;
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    margin-right: 4px;
+    vertical-align: middle;
+  }
+  .status-bar .ws-indicator.connected { background: #4caf50; }
+  .status-bar .ws-indicator.disconnected { background: #ff6b6b; }
+
+  /* Panels */
+  .panel-row {
+    margin-top: 16px;
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    justify-content: center;
+    max-width: 700px;
+    width: 100%;
+  }
 
   details {
-    margin-top: 24px;
+    flex: 1 1 320px;
     max-width: 500px;
-    width: 100%;
     background: #16213e;
     border: 1px solid #0f3460;
     border-radius: 8px;
@@ -84,84 +96,215 @@
   }
 
   summary {
-    padding: 12px 16px;
+    padding: 10px 14px;
     cursor: pointer;
-    font-size: 0.9rem;
+    font-size: 0.85rem;
     font-weight: 500;
     color: #aaa;
     user-select: none;
   }
-
   summary:hover { color: #e0e0e0; }
 
-  .guide-content {
-    padding: 0 16px 16px;
-    font-size: 0.82rem;
+  .panel-body {
+    padding: 0 14px 14px;
+    font-size: 0.8rem;
     line-height: 1.6;
     color: #999;
   }
 
-  .guide-content h3 {
-    color: #ccc;
-    font-size: 0.88rem;
-    margin: 12px 0 6px;
-  }
+  .panel-body h3 { color: #ccc; font-size: 0.85rem; margin: 10px 0 4px; }
+  .panel-body ol, .panel-body ul { padding-left: 20px; }
+  .panel-body li { margin-bottom: 3px; }
+  .panel-body code { color: #00d4ff; font-size: 0.8rem; }
 
-  .guide-content ol, .guide-content ul {
-    padding-left: 20px;
+  /* Preset list */
+  .preset-list { list-style: none; padding: 0; margin: 8px 0; }
+  .preset-list li {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 5px 8px;
+    margin: 3px 0;
+    background: #1a1a2e;
+    border-radius: 4px;
+    font-size: 0.8rem;
   }
+  .preset-list li .preset-name { cursor: pointer; flex: 1; }
+  .preset-list li .preset-name:hover { color: #00d4ff; }
+  .preset-list li .preset-delete {
+    cursor: pointer;
+    color: #666;
+    margin-left: 8px;
+    font-size: 0.9rem;
+  }
+  .preset-list li .preset-delete:hover { color: #ff6b6b; }
 
-  .guide-content li { margin-bottom: 4px; }
-  .guide-content code { color: #00d4ff; font-size: 0.82rem; }
+  .preset-save-row {
+    display: flex; gap: 6px; margin-top: 6px;
+  }
+  .preset-save-row input {
+    flex: 1;
+    background: #1a1a2e;
+    color: #e0e0e0;
+    border: 1px solid #0f3460;
+    border-radius: 4px;
+    padding: 5px 8px;
+    font-size: 0.8rem;
+    outline: none;
+  }
+  .preset-save-row input:focus { border-color: #00d4ff; }
+
+  /* Group management */
+  .group-list { list-style: none; padding: 0; margin: 6px 0; }
+  .group-list li {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 5px 8px; margin: 3px 0; background: #1a1a2e; border-radius: 4px;
+    font-size: 0.8rem;
+  }
+  .group-list li .group-name { color: #00d4ff; }
+  .group-list li .group-members { color: #888; font-size: 0.75rem; margin-left: 6px; flex: 1; }
+  .group-list li .group-delete { cursor: pointer; color: #666; margin-left: 8px; }
+  .group-list li .group-delete:hover { color: #ff6b6b; }
+
+  .group-create-row { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+  .group-create-row input {
+    flex: 1; min-width: 100px;
+    background: #1a1a2e; color: #e0e0e0; border: 1px solid #0f3460;
+    border-radius: 4px; padding: 5px 8px; font-size: 0.8rem; outline: none;
+  }
+  .group-create-row input:focus { border-color: #00d4ff; }
+
+  .device-checkbox-list { list-style: none; padding: 0; margin: 6px 0; }
+  .device-checkbox-list li {
+    display: flex; align-items: center; gap: 6px;
+    padding: 3px 0; font-size: 0.8rem;
+  }
+  .device-checkbox-list input[type="checkbox"] { accent-color: #00d4ff; }
+
+  /* EQ panel */
+  .eq-device-section { margin: 8px 0; padding: 8px; background: #1a1a2e; border-radius: 4px; }
+  .eq-device-section .eq-name { font-size: 0.82rem; color: #ccc; margin-bottom: 6px; }
+  .eq-slider-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; font-size: 0.78rem; }
+  .eq-slider-row label { width: 45px; color: #888; }
+  .eq-slider-row input[type="range"] {
+    flex: 1; accent-color: #00d4ff;
+    -webkit-appearance: none; height: 4px; background: #0f3460; border-radius: 2px;
+  }
+  .eq-slider-row .eq-val { width: 36px; text-align: right; color: #aaa; font-size: 0.75rem; }
+
+  /* Keyboard help */
+  .kbd { display: inline-block; background: #0f3460; border-radius: 3px; padding: 1px 5px; font-size: 0.75rem; font-family: monospace; color: #ccc; }
+
+  /* Screen reader only */
+  .sr-only {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0,0,0,0); border: 0;
+  }
 </style>
 </head>
 <body>
 
 <h1>Bluetooth Crossfade Mixer</h1>
-<p class="subtitle">Drag the control point to blend volume between speakers</p>
+<p class="subtitle">Drag the control point or use arrow keys to blend volume between speakers</p>
 
-<canvas id="mixer" width="500" height="500"></canvas>
+<!-- Live region for screen readers -->
+<div id="ariaLive" class="sr-only" aria-live="polite" aria-atomic="true"></div>
 
-<div class="controls">
-  <button id="btnRefresh">Refresh Devices</button>
+<canvas id="mixer" width="500" height="500" tabindex="0" role="application"
+  aria-label="Radial crossfade mixer. Use arrow keys to move the control point between speakers."></canvas>
+
+<div class="toolbar">
+  <button id="btnRefresh" aria-label="Refresh connected devices">Refresh</button>
+  <select id="selCurve" aria-label="Crossfade curve type">
+    <option value="inverse-square">Inverse Square</option>
+    <option value="linear">Linear</option>
+    <option value="logarithmic">Logarithmic</option>
+    <option value="equal-power">Equal Power</option>
+  </select>
+  <button id="btnCenterReset" aria-label="Reset control point to center">Center</button>
 </div>
 
-<div id="statusBar" class="status-bar">Connecting...</div>
+<div id="statusBar" class="status-bar">
+  <span class="ws-indicator disconnected" id="wsIndicator"></span>
+  Connecting...
+</div>
 
-<details>
-  <summary>Setup Guide &mdash; Multi-Output Audio on Windows</summary>
-  <div class="guide-content">
-    <p>Windows only routes audio to one output by default. To send audio to multiple speakers simultaneously, use one of these methods:</p>
+<div class="panel-row">
+  <!-- Presets Panel -->
+  <details id="presetsPanel">
+    <summary>Presets</summary>
+    <div class="panel-body">
+      <p>Save and recall control point positions.</p>
+      <ul class="preset-list" id="presetList"></ul>
+      <div class="preset-save-row">
+        <input type="text" id="presetNameInput" placeholder="Preset name..." maxlength="64" aria-label="Preset name">
+        <button id="btnSavePreset">Save</button>
+      </div>
+    </div>
+  </details>
 
-    <h3>Method 1: Stereo Mix (Built-in)</h3>
-    <ol>
-      <li>Right-click the speaker icon in the taskbar &rarr; <code>Sounds</code></li>
-      <li>Go to the <code>Recording</code> tab</li>
-      <li>Right-click and enable <code>Show Disabled Devices</code></li>
-      <li>Enable <code>Stereo Mix</code></li>
-      <li>Right-click Stereo Mix &rarr; <code>Properties</code> &rarr; <code>Listen</code> tab</li>
-      <li>Check <code>Listen to this device</code> and select your secondary speaker</li>
-      <li>Click Apply &mdash; audio now plays on both outputs</li>
-    </ol>
+  <!-- Groups Panel -->
+  <details id="groupsPanel">
+    <summary>Device Groups</summary>
+    <div class="panel-body">
+      <p>Link speakers into zones that share the same volume.</p>
+      <ul class="group-list" id="groupList"></ul>
+      <div class="group-create-row">
+        <input type="text" id="groupNameInput" placeholder="Group name..." maxlength="64" aria-label="Group name">
+        <button id="btnCreateGroup">Create</button>
+      </div>
+      <ul class="device-checkbox-list" id="groupDeviceChecklist"></ul>
+    </div>
+  </details>
+</div>
 
-    <h3>Method 2: Voicemeeter (Third-Party)</h3>
-    <ol>
-      <li>Download and install <code>Voicemeeter</code> (free)</li>
-      <li>Set Voicemeeter as your default playback device</li>
-      <li>In Voicemeeter, assign multiple hardware outputs (A1, A2, etc.) to your Bluetooth speakers</li>
-      <li>Audio is now routed to all assigned outputs</li>
-    </ol>
+<div class="panel-row">
+  <!-- EQ Panel -->
+  <details id="eqPanel">
+    <summary>Equalizer (per device)</summary>
+    <div class="panel-body">
+      <p>Adjust bass and treble per speaker. Requires <code>Equalizer APO</code> or <code>Voicemeeter</code> for actual audio processing.</p>
+      <div id="eqContainer"></div>
+    </div>
+  </details>
 
-    <p>Once multi-output is configured, this mixer controls the volume balance between your speakers.</p>
-  </div>
-</details>
+  <!-- Setup Guide -->
+  <details>
+    <summary>Setup Guide</summary>
+    <div class="panel-body">
+      <p>Windows only routes audio to one output by default. To send audio to multiple speakers:</p>
+      <h3>Method 1: Stereo Mix (Built-in)</h3>
+      <ol>
+        <li>Right-click speaker icon &rarr; <code>Sounds</code></li>
+        <li><code>Recording</code> tab &rarr; right-click &rarr; <code>Show Disabled Devices</code></li>
+        <li>Enable <code>Stereo Mix</code></li>
+        <li>Properties &rarr; <code>Listen</code> &rarr; check <code>Listen to this device</code> &rarr; select secondary speaker</li>
+      </ol>
+      <h3>Method 2: Voicemeeter (Third-Party)</h3>
+      <ol>
+        <li>Install Voicemeeter (free) &rarr; set as default playback</li>
+        <li>Assign hardware outputs (A1, A2) to your speakers</li>
+      </ol>
+      <h3>Keyboard Shortcuts</h3>
+      <ul>
+        <li><span class="kbd">Arrow keys</span> Move control point</li>
+        <li><span class="kbd">Shift+Arrows</span> Fine movement</li>
+        <li><span class="kbd">Home</span> Center control point</li>
+        <li><span class="kbd">M</span> Toggle mute on nearest speaker</li>
+        <li><span class="kbd">1-9</span> Load preset by number</li>
+        <li><span class="kbd">Tab</span> Cycle focus to next speaker</li>
+      </ul>
+    </div>
+  </details>
+</div>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
 <script>
 (function () {
   "use strict";
 
   // -----------------------------------------------------------------------
-  // State
+  // Constants
   // -----------------------------------------------------------------------
   const canvas = document.getElementById("mixer");
   const ctx = canvas.getContext("2d");
@@ -170,92 +313,219 @@
   const RING_RADIUS = 190;
   const NODE_RADIUS = 28;
   const CP_RADIUS = 16;
-  const EPSILON = 400; // prevents div-by-zero in inverse-square weighting
+  const EPSILON = 400;
+  const ARROW_STEP = 12;
+  const ARROW_FINE_STEP = 3;
 
+  // -----------------------------------------------------------------------
+  // State
+  // -----------------------------------------------------------------------
   const state = {
-    devices: [],           // [{id, name, volume, x, y, displayVol}]
-    cp: { x: CX, y: CY }, // control point
+    devices: [],
+    cp: { x: CX, y: CY },
     isDragging: false,
     connected: false,
+    wsConnected: false,
     lastError: null,
-    lastSentVolumes: {},   // device_id -> last volume sent (for throttling)
+    lastSentVolumes: {},
+    curveType: "inverse-square",
+    mutedDevices: new Set(),
+    groups: {},
+    focusedDeviceIndex: -1,
   };
 
   const statusBar = document.getElementById("statusBar");
+  const wsIndicator = document.getElementById("wsIndicator");
+  const ariaLive = document.getElementById("ariaLive");
 
   // -----------------------------------------------------------------------
-  // Device fetching
+  // WebSocket
   // -----------------------------------------------------------------------
+  let socket = null;
+  try {
+    socket = io({ transports: ["websocket", "polling"] });
 
+    socket.on("connect", () => {
+      state.wsConnected = true;
+      updateStatus();
+    });
+
+    socket.on("disconnect", () => {
+      state.wsConnected = false;
+      updateStatus();
+    });
+
+    socket.on("devices_updated", (devices) => {
+      layoutDevices(devices);
+      state.connected = true;
+      state.lastError = null;
+      updateStatus();
+      renderEQPanel();
+      renderGroupDeviceChecklist();
+    });
+
+    socket.on("groups_updated", (groups) => {
+      state.groups = groups || {};
+      renderGroupList();
+    });
+
+    socket.on("mute_changed", (data) => {
+      if (data.muted) {
+        state.mutedDevices.add(data.device_id);
+      } else {
+        state.mutedDevices.delete(data.device_id);
+      }
+    });
+
+    socket.on("eq_changed", (data) => {
+      const dev = state.devices.find(d => d.id === data.device_id);
+      if (dev) dev.eq = data.eq;
+    });
+
+    socket.on("device_reconnected", (data) => {
+      announce(`Device reconnected, volume restored to ${Math.round(data.restored_volume * 100)}%`);
+    });
+  } catch (e) {
+    // Fallback: no WebSocket support, use HTTP polling
+    console.warn("WebSocket unavailable, falling back to HTTP polling");
+  }
+
+  // -----------------------------------------------------------------------
+  // Accessibility announcements
+  // -----------------------------------------------------------------------
+  function announce(msg) {
+    ariaLive.textContent = msg;
+  }
+
+  // -----------------------------------------------------------------------
+  // Device layout
+  // -----------------------------------------------------------------------
+  function layoutDevices(devices) {
+    const n = devices.length;
+    devices.forEach((d, i) => {
+      const angle = (i * 2 * Math.PI) / n - Math.PI / 2;
+      d.x = CX + RING_RADIUS * Math.cos(angle);
+      d.y = CY + RING_RADIUS * Math.sin(angle);
+      const prev = state.devices.find(p => p.id === d.id);
+      d.displayVol = prev ? prev.displayVol : (d.volume ?? 0);
+      d.targetVol = prev ? prev.targetVol : (d.volume ?? 0);
+      // Preserve mute state from server
+      if (d.muted) state.mutedDevices.add(d.id);
+    });
+    state.devices = devices;
+  }
+
+  // -----------------------------------------------------------------------
+  // Device fetching (HTTP fallback)
+  // -----------------------------------------------------------------------
   async function fetchDevices() {
     try {
       const res = await fetch("/api/devices");
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const devices = await res.json();
-
-      // Lay out devices evenly on the ring
-      const n = devices.length;
-      devices.forEach((d, i) => {
-        const angle = (i * 2 * Math.PI) / n - Math.PI / 2; // start at top
-        d.x = CX + RING_RADIUS * Math.cos(angle);
-        d.y = CY + RING_RADIUS * Math.sin(angle);
-        // Preserve smooth display volume from prior frame if device existed
-        const prev = state.devices.find(p => p.id === d.id);
-        d.displayVol = prev ? prev.displayVol : (d.volume ?? 0);
-      });
-
-      state.devices = devices;
+      layoutDevices(devices);
       state.connected = true;
       state.lastError = null;
       updateStatus();
-    } catch (err) {
+      renderEQPanel();
+      renderGroupDeviceChecklist();
+    } catch {
       state.connected = false;
-      state.lastError = "Connection lost — retrying...";
+      state.lastError = "Connection lost \u2014 retrying...";
       updateStatus();
     }
   }
 
   function updateStatus() {
+    const wsSpan = `<span class="ws-indicator ${state.wsConnected ? 'connected' : 'disconnected'}" id="wsIndicator"></span>`;
     if (!state.connected) {
-      statusBar.textContent = state.lastError || "Disconnected";
+      statusBar.innerHTML = wsSpan + (state.lastError || "Disconnected");
       statusBar.className = "status-bar error";
     } else {
       const n = state.devices.length;
-      statusBar.textContent = n > 0
+      const muted = state.mutedDevices.size;
+      let text = n > 0
         ? `${n} device${n !== 1 ? "s" : ""} connected`
         : "No speakers detected";
+      if (muted > 0) text += ` \u00b7 ${muted} muted`;
+      text += ` \u00b7 ${state.curveType}`;
+      statusBar.innerHTML = wsSpan + text;
       statusBar.className = "status-bar";
     }
   }
 
   // -----------------------------------------------------------------------
-  // Volume calculation & sending
+  // Crossfade curve functions
   // -----------------------------------------------------------------------
+  const curves = {
+    "inverse-square": (distSq) => 1 / (distSq + EPSILON),
+    "linear": (distSq) => {
+      const dist = Math.sqrt(distSq);
+      const maxDist = RING_RADIUS * 2;
+      return Math.max(0, 1 - dist / maxDist);
+    },
+    "logarithmic": (distSq) => {
+      const dist = Math.sqrt(distSq);
+      return 1 / (1 + Math.log1p(dist) * 0.5);
+    },
+    "equal-power": (distSq) => {
+      const dist = Math.sqrt(distSq);
+      const maxDist = RING_RADIUS * 2;
+      const ratio = Math.min(1, dist / maxDist);
+      return Math.cos(ratio * Math.PI / 2);
+    },
+  };
 
+  // -----------------------------------------------------------------------
+  // Volume calculation
+  // -----------------------------------------------------------------------
   function computeVolumes() {
     if (state.devices.length === 0) return;
 
+    const curveFn = curves[state.curveType] || curves["inverse-square"];
+
     const weights = state.devices.map(d => {
+      if (state.mutedDevices.has(d.id)) return 0;
       const dx = state.cp.x - d.x;
       const dy = state.cp.y - d.y;
-      const distSq = dx * dx + dy * dy;
-      return 1 / (distSq + EPSILON);
+      return curveFn(dx * dx + dy * dy);
     });
 
     const maxW = Math.max(...weights);
 
+    // Apply group logic: devices in the same group get the same (max) volume
+    const groupVolumes = {};
+
     state.devices.forEach((d, i) => {
+      if (state.mutedDevices.has(d.id)) {
+        d.targetVol = 0;
+        return;
+      }
       const normalized = maxW > 0 ? weights[i] / maxW : 0;
       d.targetVol = normalized < 0.02 ? 0 : normalized;
+
+      // Track max volume per group
+      if (d.group) {
+        if (!groupVolumes[d.group] || d.targetVol > groupVolumes[d.group]) {
+          groupVolumes[d.group] = d.targetVol;
+        }
+      }
+    });
+
+    // Apply group volumes: all members of a group get the max volume
+    state.devices.forEach(d => {
+      if (d.group && groupVolumes[d.group] !== undefined) {
+        d.targetVol = groupVolumes[d.group];
+      }
     });
   }
 
   async function sendVolumes() {
     const toSend = [];
     for (const d of state.devices) {
+      if (state.mutedDevices.has(d.id)) continue;
       const target = d.targetVol ?? d.volume ?? 0;
       const lastSent = state.lastSentVolumes[d.id];
-      // Only send if changed by more than 1%
       if (lastSent === undefined || Math.abs(target - lastSent) > 0.01) {
         toSend.push({ device_id: d.id, volume: Math.round(target * 1000) / 1000 });
         state.lastSentVolumes[d.id] = target;
@@ -264,27 +534,29 @@
 
     if (toSend.length === 0) return;
 
-    try {
-      await fetch("/api/volume/batch", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ volumes: toSend }),
-      });
-    } catch {
-      // Volume send failure is non-critical — next frame will retry
+    // Prefer WebSocket for lower latency
+    if (socket && socket.connected) {
+      socket.emit("set_volumes_batch", { volumes: toSend });
+    } else {
+      try {
+        await fetch("/api/volume/batch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ volumes: toSend }),
+        });
+      } catch { /* retry next frame */ }
     }
   }
 
   // -----------------------------------------------------------------------
   // Drawing
   // -----------------------------------------------------------------------
-
   function lerp(a, b, t) { return a + (b - a) * t; }
 
   function draw() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Background ring
+    // Background rings
     ctx.beginPath();
     ctx.arc(CX, CY, RING_RADIUS + 30, 0, Math.PI * 2);
     ctx.strokeStyle = "rgba(255,255,255,0.04)";
@@ -307,8 +579,32 @@
       return;
     }
 
-    // Connection lines from control point to each device
+    // Group arcs — draw colored arcs connecting grouped devices
+    const drawnGroups = new Set();
     for (const d of state.devices) {
+      if (d.group && !drawnGroups.has(d.group)) {
+        drawnGroups.add(d.group);
+        const members = state.devices.filter(m => m.group === d.group);
+        if (members.length >= 2) {
+          const groupColor = stringToColor(d.group);
+          ctx.beginPath();
+          ctx.strokeStyle = groupColor + "40";
+          ctx.lineWidth = 3;
+          for (let i = 0; i < members.length; i++) {
+            const m = members[i];
+            if (i === 0) ctx.moveTo(m.x, m.y);
+            else ctx.lineTo(m.x, m.y);
+          }
+          ctx.closePath();
+          ctx.stroke();
+        }
+      }
+    }
+
+    // Connection lines
+    for (const d of state.devices) {
+      const isMuted = state.mutedDevices.has(d.id);
+      if (isMuted) continue;
       const vol = d.displayVol ?? 0;
       if (vol < 0.01) continue;
 
@@ -321,13 +617,15 @@
     }
 
     // Device nodes
-    for (const d of state.devices) {
-      const target = d.targetVol ?? d.volume ?? 0;
+    state.devices.forEach((d, idx) => {
+      const isMuted = state.mutedDevices.has(d.id);
+      const target = isMuted ? 0 : (d.targetVol ?? d.volume ?? 0);
       d.displayVol = lerp(d.displayVol ?? 0, target, 0.15);
       const vol = d.displayVol;
+      const isFocused = idx === state.focusedDeviceIndex;
 
       // Glow
-      if (vol > 0.01) {
+      if (vol > 0.01 && !isMuted) {
         const grad = ctx.createRadialGradient(d.x, d.y, NODE_RADIUS * 0.5, d.x, d.y, NODE_RADIUS * 2 + vol * 20);
         grad.addColorStop(0, `rgba(0, 212, 255, ${vol * 0.4})`);
         grad.addColorStop(1, "rgba(0, 212, 255, 0)");
@@ -340,27 +638,52 @@
       // Node circle
       ctx.beginPath();
       ctx.arc(d.x, d.y, NODE_RADIUS, 0, Math.PI * 2);
-      const brightness = 30 + vol * 40;
-      ctx.fillStyle = `hsl(195, 80%, ${brightness}%)`;
-      ctx.fill();
-      ctx.strokeStyle = vol > 0.01 ? `rgba(0, 212, 255, ${0.4 + vol * 0.6})` : "rgba(255,255,255,0.15)";
-      ctx.lineWidth = 2;
+      if (isMuted) {
+        ctx.fillStyle = "#2a2a3e";
+        ctx.fill();
+        ctx.strokeStyle = "rgba(255,255,255,0.1)";
+      } else {
+        const brightness = 30 + vol * 40;
+        ctx.fillStyle = `hsl(195, 80%, ${brightness}%)`;
+        ctx.fill();
+        ctx.strokeStyle = vol > 0.01 ? `rgba(0, 212, 255, ${0.4 + vol * 0.6})` : "rgba(255,255,255,0.15)";
+      }
+      ctx.lineWidth = isFocused ? 3 : 2;
       ctx.stroke();
 
-      // Volume percentage inside node
-      ctx.fillStyle = "#fff";
+      // Focus ring
+      if (isFocused) {
+        ctx.beginPath();
+        ctx.arc(d.x, d.y, NODE_RADIUS + 4, 0, Math.PI * 2);
+        ctx.strokeStyle = "#ff8c32";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+      }
+
+      // Text inside node
+      ctx.fillStyle = isMuted ? "#666" : "#fff";
       ctx.font = "bold 13px sans-serif";
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      ctx.fillText(`${Math.round(vol * 100)}%`, d.x, d.y);
+      if (isMuted) {
+        ctx.fillText("MUTE", d.x, d.y);
+      } else {
+        ctx.fillText(`${Math.round(vol * 100)}%`, d.x, d.y);
+      }
 
-      // Device name below node
-      ctx.fillStyle = "#aaa";
+      // Device name
+      ctx.fillStyle = isMuted ? "#555" : "#aaa";
       ctx.font = "11px sans-serif";
-      ctx.textAlign = "center";
       const name = d.name.length > 20 ? d.name.slice(0, 18) + "..." : d.name;
       ctx.fillText(name, d.x, d.y + NODE_RADIUS + 14);
-    }
+
+      // Group tag
+      if (d.group) {
+        ctx.fillStyle = stringToColor(d.group);
+        ctx.font = "9px sans-serif";
+        ctx.fillText(d.group, d.x, d.y + NODE_RADIUS + 26);
+      }
+    });
 
     // Control point
     const cpGrad = ctx.createRadialGradient(state.cp.x, state.cp.y, 2, state.cp.x, state.cp.y, CP_RADIUS);
@@ -374,7 +697,7 @@
     ctx.lineWidth = 2.5;
     ctx.stroke();
 
-    // Small crosshair inside control point
+    // Crosshair inside control point
     ctx.strokeStyle = "rgba(0,0,0,0.3)";
     ctx.lineWidth = 1;
     ctx.beginPath();
@@ -384,23 +707,33 @@
     ctx.lineTo(state.cp.x, state.cp.y + 5);
     ctx.stroke();
 
+    // Curve type label (small, bottom-right of canvas)
+    ctx.fillStyle = "rgba(255,255,255,0.15)";
+    ctx.font = "10px sans-serif";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "bottom";
+    ctx.fillText(state.curveType, canvas.width - 16, canvas.height - 10);
+
     requestAnimationFrame(draw);
   }
 
-  // -----------------------------------------------------------------------
-  // Interaction
-  // -----------------------------------------------------------------------
+  function stringToColor(str) {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) hash = str.charCodeAt(i) + ((hash << 5) - hash);
+    const h = Math.abs(hash) % 360;
+    return `hsl(${h}, 70%, 60%)`;
+  }
 
+  // -----------------------------------------------------------------------
+  // Pointer interaction
+  // -----------------------------------------------------------------------
   function getPointerPos(e) {
     const rect = canvas.getBoundingClientRect();
     const scaleX = canvas.width / rect.width;
     const scaleY = canvas.height / rect.height;
     const clientX = e.touches ? e.touches[0].clientX : e.clientX;
     const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-    return {
-      x: (clientX - rect.left) * scaleX,
-      y: (clientY - rect.top) * scaleY,
-    };
+    return { x: (clientX - rect.left) * scaleX, y: (clientY - rect.top) * scaleY };
   }
 
   function isNearCP(pos) {
@@ -409,19 +742,47 @@
     return dx * dx + dy * dy <= (CP_RADIUS + 10) * (CP_RADIUS + 10);
   }
 
+  function isNearDevice(pos) {
+    for (let i = 0; i < state.devices.length; i++) {
+      const d = state.devices[i];
+      const dx = pos.x - d.x;
+      const dy = pos.y - d.y;
+      if (dx * dx + dy * dy <= (NODE_RADIUS + 6) * (NODE_RADIUS + 6)) return i;
+    }
+    return -1;
+  }
+
   function clampToRing(x, y) {
     const dx = x - CX;
     const dy = y - CY;
     const dist = Math.sqrt(dx * dx + dy * dy);
     const maxDist = RING_RADIUS - 5;
-    if (dist > maxDist) {
-      return { x: CX + (dx / dist) * maxDist, y: CY + (dy / dist) * maxDist };
-    }
+    if (dist > maxDist) return { x: CX + (dx / dist) * maxDist, y: CY + (dy / dist) * maxDist };
     return { x, y };
   }
 
+  function nearestDeviceIndex() {
+    let nearest = -1, minDist = Infinity;
+    state.devices.forEach((d, i) => {
+      const dx = state.cp.x - d.x;
+      const dy = state.cp.y - d.y;
+      const dist = dx * dx + dy * dy;
+      if (dist < minDist) { minDist = dist; nearest = i; }
+    });
+    return nearest;
+  }
+
+  // Mouse events
   canvas.addEventListener("mousedown", (e) => {
     const pos = getPointerPos(e);
+
+    // Check for click on device node (toggle mute)
+    const devIdx = isNearDevice(pos);
+    if (devIdx >= 0 && !isNearCP(pos)) {
+      toggleMute(state.devices[devIdx].id);
+      return;
+    }
+
     if (isNearCP(pos)) {
       state.isDragging = true;
       canvas.style.cursor = "grabbing";
@@ -436,27 +797,29 @@
       state.cp.y = clamped.y;
       computeVolumes();
     } else {
-      canvas.style.cursor = isNearCP(pos) ? "grab" : "default";
+      const devIdx = isNearDevice(pos);
+      if (isNearCP(pos)) canvas.style.cursor = "grab";
+      else if (devIdx >= 0) canvas.style.cursor = "pointer";
+      else canvas.style.cursor = "default";
     }
   });
 
   canvas.addEventListener("mouseup", () => {
-    state.isDragging = false;
+    if (state.isDragging) { state.isDragging = false; sendVolumes(); }
     canvas.style.cursor = "default";
   });
 
   canvas.addEventListener("mouseleave", () => {
-    state.isDragging = false;
+    if (state.isDragging) { state.isDragging = false; sendVolumes(); }
     canvas.style.cursor = "default";
   });
 
-  // Touch support
+  // Touch events
   canvas.addEventListener("touchstart", (e) => {
     const pos = getPointerPos(e);
-    if (isNearCP(pos)) {
-      state.isDragging = true;
-      e.preventDefault();
-    }
+    const devIdx = isNearDevice(pos);
+    if (devIdx >= 0 && !isNearCP(pos)) { toggleMute(state.devices[devIdx].id); e.preventDefault(); return; }
+    if (isNearCP(pos)) { state.isDragging = true; e.preventDefault(); }
   }, { passive: false });
 
   canvas.addEventListener("touchmove", (e) => {
@@ -470,16 +833,369 @@
     }
   }, { passive: false });
 
-  canvas.addEventListener("touchend", () => { state.isDragging = false; });
+  canvas.addEventListener("touchend", () => {
+    if (state.isDragging) { state.isDragging = false; sendVolumes(); }
+  });
+
+  // -----------------------------------------------------------------------
+  // Keyboard controls
+  // -----------------------------------------------------------------------
+  canvas.addEventListener("keydown", (e) => {
+    const step = e.shiftKey ? ARROW_FINE_STEP : ARROW_STEP;
+    let handled = true;
+
+    switch (e.key) {
+      case "ArrowUp": {
+        const c = clampToRing(state.cp.x, state.cp.y - step);
+        state.cp.x = c.x; state.cp.y = c.y;
+        computeVolumes(); sendVolumes();
+        announcePosition();
+        break;
+      }
+      case "ArrowDown": {
+        const c = clampToRing(state.cp.x, state.cp.y + step);
+        state.cp.x = c.x; state.cp.y = c.y;
+        computeVolumes(); sendVolumes();
+        announcePosition();
+        break;
+      }
+      case "ArrowLeft": {
+        const c = clampToRing(state.cp.x - step, state.cp.y);
+        state.cp.x = c.x; state.cp.y = c.y;
+        computeVolumes(); sendVolumes();
+        announcePosition();
+        break;
+      }
+      case "ArrowRight": {
+        const c = clampToRing(state.cp.x + step, state.cp.y);
+        state.cp.x = c.x; state.cp.y = c.y;
+        computeVolumes(); sendVolumes();
+        announcePosition();
+        break;
+      }
+      case "Home": {
+        state.cp.x = CX; state.cp.y = CY;
+        computeVolumes(); sendVolumes();
+        announce("Control point centered");
+        break;
+      }
+      case "m":
+      case "M": {
+        const ni = nearestDeviceIndex();
+        if (ni >= 0) toggleMute(state.devices[ni].id);
+        break;
+      }
+      case "Tab": {
+        e.preventDefault();
+        if (state.devices.length > 0) {
+          state.focusedDeviceIndex = (state.focusedDeviceIndex + 1) % state.devices.length;
+          const d = state.devices[state.focusedDeviceIndex];
+          const vol = Math.round((d.displayVol ?? 0) * 100);
+          const muted = state.mutedDevices.has(d.id) ? ", muted" : "";
+          announce(`${d.name}, ${vol}%${muted}`);
+        }
+        break;
+      }
+      default: {
+        // Number keys 1-9 for presets
+        const num = parseInt(e.key);
+        if (num >= 1 && num <= 9) {
+          const presets = loadPresets();
+          if (num <= presets.length) {
+            applyPreset(presets[num - 1]);
+          }
+        } else {
+          handled = false;
+        }
+      }
+    }
+
+    if (handled) e.preventDefault();
+  });
+
+  function announcePosition() {
+    const nearest = nearestDeviceIndex();
+    if (nearest >= 0) {
+      const d = state.devices[nearest];
+      const vol = Math.round((d.targetVol ?? 0) * 100);
+      announce(`Nearest: ${d.name} at ${vol}%`);
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Mute toggle
+  // -----------------------------------------------------------------------
+  async function toggleMute(deviceId) {
+    const isMuted = state.mutedDevices.has(deviceId);
+    const newMuted = !isMuted;
+
+    if (newMuted) state.mutedDevices.add(deviceId);
+    else state.mutedDevices.delete(deviceId);
+
+    const dev = state.devices.find(d => d.id === deviceId);
+    const name = dev ? dev.name : deviceId;
+    announce(`${name} ${newMuted ? "muted" : "unmuted"}`);
+
+    computeVolumes();
+    sendVolumes();
+    updateStatus();
+
+    try {
+      await fetch("/api/mute", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device_id: deviceId, muted: newMuted }),
+      });
+    } catch { /* ignore */ }
+  }
+
+  // -----------------------------------------------------------------------
+  // Presets (localStorage)
+  // -----------------------------------------------------------------------
+  const PRESETS_KEY = "bt-mixer-presets";
+
+  function loadPresets() {
+    try {
+      return JSON.parse(localStorage.getItem(PRESETS_KEY)) || [];
+    } catch { return []; }
+  }
+
+  function savePresets(presets) {
+    localStorage.setItem(PRESETS_KEY, JSON.stringify(presets.slice(0, 20)));
+    renderPresetList();
+  }
+
+  function applyPreset(preset) {
+    state.cp.x = preset.x;
+    state.cp.y = preset.y;
+    if (preset.curve) {
+      state.curveType = preset.curve;
+      document.getElementById("selCurve").value = preset.curve;
+    }
+    computeVolumes();
+    sendVolumes();
+    announce(`Loaded preset: ${preset.name}`);
+  }
+
+  function renderPresetList() {
+    const list = document.getElementById("presetList");
+    const presets = loadPresets();
+    list.innerHTML = "";
+    presets.forEach((p, i) => {
+      const li = document.createElement("li");
+      const nameSpan = document.createElement("span");
+      nameSpan.className = "preset-name";
+      nameSpan.textContent = `${i + 1}. ${p.name}`;
+      nameSpan.title = `Load preset "${p.name}" (or press ${i + 1})`;
+      nameSpan.addEventListener("click", () => applyPreset(p));
+
+      const delBtn = document.createElement("span");
+      delBtn.className = "preset-delete";
+      delBtn.textContent = "\u00d7";
+      delBtn.title = "Delete preset";
+      delBtn.addEventListener("click", () => {
+        const updated = loadPresets().filter((_, j) => j !== i);
+        savePresets(updated);
+      });
+
+      li.appendChild(nameSpan);
+      li.appendChild(delBtn);
+      list.appendChild(li);
+    });
+  }
+
+  document.getElementById("btnSavePreset").addEventListener("click", () => {
+    const input = document.getElementById("presetNameInput");
+    const name = input.value.trim();
+    if (!name) return;
+    const presets = loadPresets();
+    presets.push({
+      name,
+      x: state.cp.x,
+      y: state.cp.y,
+      curve: state.curveType,
+    });
+    savePresets(presets);
+    input.value = "";
+    announce(`Saved preset: ${name}`);
+  });
+
+  // -----------------------------------------------------------------------
+  // Crossfade curve selector
+  // -----------------------------------------------------------------------
+  document.getElementById("selCurve").addEventListener("change", (e) => {
+    state.curveType = e.target.value;
+    computeVolumes();
+    sendVolumes();
+    updateStatus();
+    announce(`Crossfade curve: ${state.curveType}`);
+  });
+
+  // -----------------------------------------------------------------------
+  // Center reset button
+  // -----------------------------------------------------------------------
+  document.getElementById("btnCenterReset").addEventListener("click", () => {
+    state.cp.x = CX;
+    state.cp.y = CY;
+    computeVolumes();
+    sendVolumes();
+    announce("Control point centered");
+  });
+
+  // -----------------------------------------------------------------------
+  // Groups
+  // -----------------------------------------------------------------------
+  function renderGroupList() {
+    const list = document.getElementById("groupList");
+    list.innerHTML = "";
+    for (const [name, members] of Object.entries(state.groups)) {
+      const li = document.createElement("li");
+      const nameSpan = document.createElement("span");
+      nameSpan.className = "group-name";
+      nameSpan.textContent = name;
+
+      const membersSpan = document.createElement("span");
+      membersSpan.className = "group-members";
+      const memberNames = members.map(mid => {
+        const dev = state.devices.find(d => d.id === mid);
+        return dev ? dev.name : mid.slice(0, 12) + "...";
+      });
+      membersSpan.textContent = memberNames.join(", ");
+
+      const delBtn = document.createElement("span");
+      delBtn.className = "group-delete";
+      delBtn.textContent = "\u00d7";
+      delBtn.addEventListener("click", async () => {
+        try {
+          await fetch(`/api/groups/${encodeURIComponent(name)}`, { method: "DELETE" });
+        } catch { /* ignore */ }
+      });
+
+      li.appendChild(nameSpan);
+      li.appendChild(membersSpan);
+      li.appendChild(delBtn);
+      list.appendChild(li);
+    }
+  }
+
+  function renderGroupDeviceChecklist() {
+    const list = document.getElementById("groupDeviceChecklist");
+    list.innerHTML = "";
+    state.devices.forEach(d => {
+      const li = document.createElement("li");
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.value = d.id;
+      cb.id = "gcb_" + d.id;
+      const label = document.createElement("label");
+      label.htmlFor = cb.id;
+      label.textContent = d.name;
+      li.appendChild(cb);
+      li.appendChild(label);
+      list.appendChild(li);
+    });
+  }
+
+  document.getElementById("btnCreateGroup").addEventListener("click", async () => {
+    const nameInput = document.getElementById("groupNameInput");
+    const name = nameInput.value.trim();
+    if (!name) return;
+
+    const checklist = document.getElementById("groupDeviceChecklist");
+    const checked = Array.from(checklist.querySelectorAll("input:checked")).map(cb => cb.value);
+    if (checked.length < 2) {
+      announce("Select at least 2 devices for a group");
+      return;
+    }
+
+    try {
+      await fetch("/api/groups", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, device_ids: checked }),
+      });
+      nameInput.value = "";
+      // Uncheck all
+      checklist.querySelectorAll("input:checked").forEach(cb => cb.checked = false);
+      announce(`Created group: ${name}`);
+    } catch { /* ignore */ }
+  });
+
+  // -----------------------------------------------------------------------
+  // EQ Panel
+  // -----------------------------------------------------------------------
+  function renderEQPanel() {
+    const container = document.getElementById("eqContainer");
+    container.innerHTML = "";
+
+    state.devices.forEach(d => {
+      const section = document.createElement("div");
+      section.className = "eq-device-section";
+
+      const nameDiv = document.createElement("div");
+      nameDiv.className = "eq-name";
+      nameDiv.textContent = d.name;
+      section.appendChild(nameDiv);
+
+      const eq = d.eq || { bass: 0, treble: 0 };
+
+      ["bass", "treble"].forEach(param => {
+        const row = document.createElement("div");
+        row.className = "eq-slider-row";
+
+        const label = document.createElement("label");
+        label.textContent = param.charAt(0).toUpperCase() + param.slice(1);
+
+        const slider = document.createElement("input");
+        slider.type = "range";
+        slider.min = "-100";
+        slider.max = "100";
+        slider.value = String(Math.round(eq[param] * 100));
+        slider.setAttribute("aria-label", `${d.name} ${param}`);
+
+        const valSpan = document.createElement("span");
+        valSpan.className = "eq-val";
+        valSpan.textContent = (eq[param] >= 0 ? "+" : "") + eq[param].toFixed(1);
+
+        slider.addEventListener("input", () => {
+          const val = parseInt(slider.value) / 100;
+          valSpan.textContent = (val >= 0 ? "+" : "") + val.toFixed(1);
+        });
+
+        slider.addEventListener("change", async () => {
+          const val = parseInt(slider.value) / 100;
+          const body = { device_id: d.id };
+          body[param] = val;
+          try {
+            await fetch("/api/eq", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(body),
+            });
+          } catch { /* ignore */ }
+        });
+
+        row.appendChild(label);
+        row.appendChild(slider);
+        row.appendChild(valSpan);
+        section.appendChild(row);
+      });
+
+      container.appendChild(section);
+    });
+  }
 
   // -----------------------------------------------------------------------
   // Refresh button
   // -----------------------------------------------------------------------
-
   document.getElementById("btnRefresh").addEventListener("click", async () => {
     try {
-      const res = await fetch("/api/refresh", { method: "POST" });
-      if (res.ok) await fetchDevices();
+      if (socket && socket.connected) {
+        socket.emit("request_refresh");
+      } else {
+        const res = await fetch("/api/refresh", { method: "POST" });
+        if (res.ok) await fetchDevices();
+      }
     } catch { /* ignore */ }
   });
 
@@ -487,20 +1203,23 @@
   // Main loop
   // -----------------------------------------------------------------------
 
-  // Send volume updates at ~30fps while dragging
-  let volumeInterval = setInterval(() => {
-    if (state.isDragging) sendVolumes();
-  }, 33);
+  // Volume updates at ~30fps while dragging
+  setInterval(() => { if (state.isDragging) sendVolumes(); }, 33);
 
-  // Also send final volumes when drag ends
-  canvas.addEventListener("mouseup", () => sendVolumes());
-  canvas.addEventListener("touchend", () => sendVolumes());
-
-  // Poll devices every 5 seconds
+  // HTTP polling fallback (only if WebSocket is not connected)
   fetchDevices();
-  setInterval(fetchDevices, 5000);
+  setInterval(() => {
+    if (!socket || !socket.connected) fetchDevices();
+  }, 5000);
 
-  // Start render loop
+  // Fetch groups on load
+  fetch("/api/groups").then(r => r.json()).then(g => {
+    state.groups = g || {};
+    renderGroupList();
+  }).catch(() => {});
+
+  // Init UI
+  renderPresetList();
   requestAnimationFrame(draw);
 })();
 </script>

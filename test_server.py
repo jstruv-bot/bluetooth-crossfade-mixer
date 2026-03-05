@@ -22,6 +22,15 @@ sys.modules["pycaw"] = MagicMock()
 sys.modules["pycaw.pycaw"] = mock_pycaw
 sys.modules["pycaw.constants"] = mock_pycaw_constants
 
+# Mock flask-socketio
+mock_socketio_module = MagicMock()
+mock_socketio_class = MagicMock()
+mock_socketio_instance = MagicMock()
+mock_socketio_class.return_value = mock_socketio_instance
+mock_socketio_module.SocketIO = mock_socketio_class
+mock_socketio_module.emit = MagicMock()
+sys.modules["flask_socketio"] = mock_socketio_module
+
 import server
 
 
@@ -40,11 +49,18 @@ class TestAPIRoutes(unittest.TestCase):
     def setUp(self):
         server.app.testing = True
         self.client = server.app.test_client()
+        # Reset state between tests
+        server._muted_devices.clear()
+        server._device_groups.clear()
+        server._last_volumes.clear()
+        server._device_eq.clear()
+        server._previous_device_ids.clear()
 
     @patch.object(server, "get_playback_devices")
     def test_get_devices(self, mock_get):
         mock_get.return_value = [
-            {"id": "dev1", "name": "Speaker A", "volume": 0.75},
+            {"id": "dev1", "name": "Speaker A", "volume": 0.75,
+             "muted": False, "group": None, "eq": {"bass": 0.0, "treble": 0.0}},
         ]
         resp = self.client.get("/api/devices")
         self.assertEqual(resp.status_code, 200)
@@ -61,8 +77,7 @@ class TestAPIRoutes(unittest.TestCase):
             content_type="application/json",
         )
         self.assertEqual(resp.status_code, 200)
-        data = json.loads(resp.data)
-        self.assertTrue(data["success"])
+        self.assertTrue(json.loads(resp.data)["success"])
 
     def test_set_volume_missing_body(self):
         resp = self.client.post("/api/volume", content_type="application/json")
@@ -120,8 +135,7 @@ class TestAPIRoutes(unittest.TestCase):
             content_type="application/json",
         )
         self.assertEqual(resp.status_code, 200)
-        data = json.loads(resp.data)
-        self.assertTrue(data["success"])
+        self.assertTrue(json.loads(resp.data)["success"])
 
     def test_batch_volume_missing_body(self):
         resp = self.client.post("/api/volume/batch", content_type="application/json")
@@ -140,6 +154,9 @@ class TestAPIRoutes(unittest.TestCase):
 
 
 class TestSetDeviceVolume(unittest.TestCase):
+    def setUp(self):
+        server._last_volumes.clear()
+
     @patch.object(server, "_get_active_render_devices")
     def test_clamps_volume(self, mock_enum):
         dev = _make_mock_device("dev1", "Speaker", 0.5)
@@ -160,8 +177,18 @@ class TestSetDeviceVolume(unittest.TestCase):
         result = server.set_device_volume("nonexistent", 0.5)
         self.assertFalse(result)
 
+    @patch.object(server, "_get_active_render_devices")
+    def test_remembers_volume_for_reconnect(self, mock_enum):
+        dev = _make_mock_device("dev1", "Speaker", 0.5)
+        mock_enum.return_value = [dev]
+        server.set_device_volume("dev1", 0.75)
+        self.assertEqual(server._last_volumes["dev1"], 0.75)
+
 
 class TestSetVolumesBatch(unittest.TestCase):
+    def setUp(self):
+        server._last_volumes.clear()
+
     @patch.object(server, "_get_active_render_devices")
     def test_batch_sets_multiple(self, mock_enum):
         dev1 = _make_mock_device("dev1", "A")
@@ -183,6 +210,205 @@ class TestSetVolumesBatch(unittest.TestCase):
         mock_enum.return_value = []
         results = server.set_volumes_batch([{"device_id": "dev1", "volume": 0.5}])
         self.assertFalse(results["dev1"])
+
+    @patch.object(server, "_get_active_render_devices")
+    def test_batch_remembers_volumes(self, mock_enum):
+        dev = _make_mock_device("dev1", "A")
+        mock_enum.return_value = [dev]
+        server.set_volumes_batch([{"device_id": "dev1", "volume": 0.6}])
+        self.assertEqual(server._last_volumes["dev1"], 0.6)
+
+
+class TestMuteAPI(unittest.TestCase):
+    def setUp(self):
+        server.app.testing = True
+        self.client = server.app.test_client()
+        server._muted_devices.clear()
+
+    @patch.object(server, "set_device_volume")
+    def test_mute_device(self, mock_set):
+        mock_set.return_value = True
+        resp = self.client.post(
+            "/api/mute",
+            data=json.dumps({"device_id": "dev1", "muted": True}),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.data)
+        self.assertTrue(data["success"])
+        self.assertTrue(data["muted"])
+        self.assertIn("dev1", server._muted_devices)
+
+    @patch.object(server, "set_device_volume")
+    def test_unmute_device(self, mock_set):
+        server._muted_devices.add("dev1")
+        resp = self.client.post(
+            "/api/mute",
+            data=json.dumps({"device_id": "dev1", "muted": False}),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn("dev1", server._muted_devices)
+
+    def test_mute_invalid_body(self):
+        resp = self.client.post("/api/mute", content_type="application/json")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_mute_invalid_muted_type(self):
+        resp = self.client.post(
+            "/api/mute",
+            data=json.dumps({"device_id": "dev1", "muted": "yes"}),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+
+class TestGroupsAPI(unittest.TestCase):
+    def setUp(self):
+        server.app.testing = True
+        self.client = server.app.test_client()
+        server._device_groups.clear()
+
+    def test_create_group(self):
+        resp = self.client.post(
+            "/api/groups",
+            data=json.dumps({"name": "Living Room", "device_ids": ["dev1", "dev2"]}),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.data)
+        self.assertTrue(data["success"])
+        self.assertIn("Living Room", data["groups"])
+
+    def test_list_groups(self):
+        server._device_groups["Zone A"] = ["dev1"]
+        resp = self.client.get("/api/groups")
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.data)
+        self.assertIn("Zone A", data)
+
+    def test_delete_group(self):
+        server._device_groups["Zone A"] = ["dev1"]
+        resp = self.client.delete("/api/groups/Zone%20A")
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn("Zone A", server._device_groups)
+
+    def test_create_group_invalid_name(self):
+        resp = self.client.post(
+            "/api/groups",
+            data=json.dumps({"name": "", "device_ids": ["dev1"]}),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_create_group_name_too_long(self):
+        resp = self.client.post(
+            "/api/groups",
+            data=json.dumps({"name": "x" * 100, "device_ids": ["dev1"]}),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_create_group_moves_devices_from_old_group(self):
+        server._device_groups["Old"] = ["dev1", "dev2"]
+        self.client.post(
+            "/api/groups",
+            data=json.dumps({"name": "New", "device_ids": ["dev1"]}),
+            content_type="application/json",
+        )
+        # dev1 should be removed from "Old" and added to "New"
+        self.assertNotIn("dev1", server._device_groups.get("Old", []))
+        self.assertIn("dev1", server._device_groups["New"])
+
+
+class TestEQAPI(unittest.TestCase):
+    def setUp(self):
+        server.app.testing = True
+        self.client = server.app.test_client()
+        server._device_eq.clear()
+
+    def test_set_eq(self):
+        resp = self.client.post(
+            "/api/eq",
+            data=json.dumps({"device_id": "dev1", "bass": 0.5, "treble": -0.3}),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.data)
+        self.assertTrue(data["success"])
+        self.assertEqual(data["eq"]["bass"], 0.5)
+        self.assertEqual(data["eq"]["treble"], -0.3)
+
+    def test_get_eq_default(self):
+        resp = self.client.get("/api/eq/dev1")
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.data)
+        self.assertEqual(data["bass"], 0.0)
+        self.assertEqual(data["treble"], 0.0)
+
+    def test_set_eq_clamps(self):
+        resp = self.client.post(
+            "/api/eq",
+            data=json.dumps({"device_id": "dev1", "bass": 5.0, "treble": -5.0}),
+            content_type="application/json",
+        )
+        data = json.loads(resp.data)
+        self.assertEqual(data["eq"]["bass"], 1.0)
+        self.assertEqual(data["eq"]["treble"], -1.0)
+
+    def test_set_eq_invalid_body(self):
+        resp = self.client.post("/api/eq", content_type="application/json")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_set_eq_invalid_device_id(self):
+        resp = self.client.post(
+            "/api/eq",
+            data=json.dumps({"device_id": 123, "bass": 0.0}),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+
+class TestAutoReconnect(unittest.TestCase):
+    def setUp(self):
+        server._last_volumes.clear()
+        server._previous_device_ids.clear()
+
+    @patch.object(server, "socketio")
+    def test_reconnect_restores_volume(self, mock_sio):
+        # Simulate: dev1 was known with volume 0.8, then disappeared, now reappears
+        server._last_volumes["dev1"] = 0.8
+        server._previous_device_ids.update(set())  # empty = first scan
+
+        dev1 = _make_mock_device("dev1", "Speaker A", 0.5)
+        current_ids = {"dev1"}
+
+        # First call to establish baseline
+        server._handle_reconnections(current_ids, [dev1])
+
+        # Now simulate dev1 disappearing and reappearing
+        server._previous_device_ids.clear()  # it disappeared
+        server._handle_reconnections(current_ids, [dev1])
+
+        # Volume should have been restored
+        dev1.EndpointVolume.SetMasterVolumeLevelScalar.assert_called_with(0.8, None)
+
+
+class TestValidateDeviceId(unittest.TestCase):
+    def test_valid(self):
+        self.assertTrue(server._validate_device_id("abc123"))
+
+    def test_too_long(self):
+        self.assertFalse(server._validate_device_id("x" * 600))
+
+    def test_not_string(self):
+        self.assertFalse(server._validate_device_id(123))
+
+    def test_empty(self):
+        self.assertFalse(server._validate_device_id(""))
+
+    def test_none(self):
+        self.assertFalse(server._validate_device_id(None))
 
 
 if __name__ == "__main__":
