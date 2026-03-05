@@ -5,6 +5,7 @@ Features: crossfade curves, mute, presets, groups, WebSocket, EQ,
           auto-reconnect, Spotify integration, audio level metering.
 """
 
+import html
 import logging
 import webbrowser
 import threading
@@ -81,6 +82,11 @@ _prev_lock = threading.Lock()
 # Audio level cache: {device_id: float (0.0-1.0)}
 _audio_levels = {}
 _levels_lock = threading.Lock()
+
+# Cached device objects for audio metering (avoids re-enumerating COM at 10fps)
+_cached_meter_devices = []
+_cached_meter_ts = 0.0
+_METER_CACHE_TTL = 3.0  # reuse device list for 3 seconds
 
 # ---------------------------------------------------------------------------
 # Spotify state
@@ -320,29 +326,33 @@ def _validate_device_id(device_id):
 
 
 def get_audio_levels():
-    """Read peak audio levels for all active render devices via IAudioMeterInformation."""
+    """Read peak audio levels for all active render devices via IAudioMeterInformation.
+
+    Caches the device list for _METER_CACHE_TTL seconds to avoid
+    re-enumerating COM devices at 10fps.
+    """
+    global _cached_meter_devices, _cached_meter_ts
+
     levels = {}
     if not _METER_AVAILABLE:
         return levels
 
-    try:
-        all_devices = _get_active_render_devices()
-    except Exception:
-        return levels
-
-    for device in all_devices:
+    now = time.monotonic()
+    if now - _cached_meter_ts > _METER_CACHE_TTL:
         try:
-            # Activate IAudioMeterInformation on the device endpoint
-            meter = device.EndpointVolume  # fallback — try to get meter info
-            try:
-                endpoint = device._dev
-                meter_info = endpoint.Activate(_IID_IAudioMeterInformation, 0, None)
-                peak = meter_info.GetPeakValue()
-                levels[device.id] = round(max(0.0, min(1.0, peak)), 4)
-            except Exception:
-                levels[device.id] = 0.0
+            _cached_meter_devices = _get_active_render_devices()
+            _cached_meter_ts = now
         except Exception:
-            continue
+            return levels
+
+    for device in _cached_meter_devices:
+        try:
+            endpoint = device._dev
+            meter_info = endpoint.Activate(_IID_IAudioMeterInformation, 0, None)
+            peak = meter_info.GetPeakValue()
+            levels[device.id] = round(max(0.0, min(1.0, peak)), 4)
+        except Exception:
+            levels[device.id] = 0.0
 
     with _levels_lock:
         _audio_levels.clear()
@@ -583,7 +593,8 @@ def api_mute():
 def api_groups_list():
     """Return all device groups."""
     with _groups_lock:
-        return jsonify(_device_groups)
+        groups_copy = dict(_device_groups)
+    return jsonify(groups_copy)
 
 
 @app.route("/api/groups", methods=["POST"])
@@ -611,12 +622,14 @@ def api_groups_create():
 
     name = name.strip()
 
+    device_ids_set = set(device_ids)
+
     with _groups_lock:
         if name not in _device_groups and len(_device_groups) >= _MAX_GROUPS:
             return jsonify({"success": False, "error": "Maximum group limit reached"}), 400
-        # Remove these devices from any other groups
+        # Remove these devices from any other groups (O(n) with set lookup)
         for gname in list(_device_groups.keys()):
-            _device_groups[gname] = [d for d in _device_groups[gname] if d not in device_ids]
+            _device_groups[gname] = [d for d in _device_groups[gname] if d not in device_ids_set]
             if not _device_groups[gname]:
                 del _device_groups[gname]
         if device_ids:
@@ -721,7 +734,7 @@ def api_spotify_callback():
     error = request.args.get("error")
 
     if error:
-        return f"<h2>Spotify auth error: {error}</h2><p><a href='/'>Back to mixer</a></p>", 400
+        return f"<h2>Spotify auth error: {html.escape(error)}</h2><p><a href='/'>Back to mixer</a></p>", 400
 
     if not code:
         return "<h2>Missing authorization code</h2><p><a href='/'>Back to mixer</a></p>", 400
@@ -743,7 +756,7 @@ def api_spotify_callback():
 
         if resp.status_code != 200:
             log.warning("Spotify token exchange failed: %s", resp.text)
-            return f"<h2>Token exchange failed</h2><pre>{resp.text}</pre><p><a href='/'>Back to mixer</a></p>", 400
+            return f"<h2>Token exchange failed</h2><pre>{html.escape(resp.text)}</pre><p><a href='/'>Back to mixer</a></p>", 400
 
         data = resp.json()
         with _spotify_lock:
@@ -758,7 +771,7 @@ def api_spotify_callback():
 
     except Exception as exc:
         log.error("Spotify callback error: %s", exc)
-        return f"<h2>Error: {exc}</h2><p><a href='/'>Back to mixer</a></p>", 500
+        return f"<h2>Error: {html.escape(str(exc))}</h2><p><a href='/'>Back to mixer</a></p>", 500
 
 
 @app.route("/api/spotify/status")
@@ -774,63 +787,45 @@ def api_spotify_status():
 def api_spotify_now_playing():
     """Return current Spotify now-playing info."""
     with _spotify_lock:
-        return jsonify(_spotify_now_playing)
+        np_copy = dict(_spotify_now_playing)
+    return jsonify(np_copy)
+
+
+def _spotify_playback_action(method, endpoint_path):
+    """Shared handler for Spotify playback control endpoints."""
+    headers = _spotify_get_headers()
+    if not headers:
+        return jsonify({"success": False, "error": "Not connected to Spotify"}), 401
+    try:
+        url = f"https://api.spotify.com/v1/me/player/{endpoint_path}"
+        resp = getattr(http_requests, method)(url, headers=headers, timeout=5)
+        return jsonify({"success": resp.status_code in (200, 204)})
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 500
 
 
 @app.route("/api/spotify/play", methods=["POST"])
 def api_spotify_play():
     """Resume Spotify playback."""
-    headers = _spotify_get_headers()
-    if not headers:
-        return jsonify({"success": False, "error": "Not connected to Spotify"}), 401
-    try:
-        resp = http_requests.put("https://api.spotify.com/v1/me/player/play",
-                                  headers=headers, timeout=5)
-        return jsonify({"success": resp.status_code in (200, 204)})
-    except Exception as exc:
-        return jsonify({"success": False, "error": str(exc)}), 500
+    return _spotify_playback_action("put", "play")
 
 
 @app.route("/api/spotify/pause", methods=["POST"])
 def api_spotify_pause():
     """Pause Spotify playback."""
-    headers = _spotify_get_headers()
-    if not headers:
-        return jsonify({"success": False, "error": "Not connected to Spotify"}), 401
-    try:
-        resp = http_requests.put("https://api.spotify.com/v1/me/player/pause",
-                                  headers=headers, timeout=5)
-        return jsonify({"success": resp.status_code in (200, 204)})
-    except Exception as exc:
-        return jsonify({"success": False, "error": str(exc)}), 500
+    return _spotify_playback_action("put", "pause")
 
 
 @app.route("/api/spotify/next", methods=["POST"])
 def api_spotify_next():
     """Skip to next track."""
-    headers = _spotify_get_headers()
-    if not headers:
-        return jsonify({"success": False, "error": "Not connected to Spotify"}), 401
-    try:
-        resp = http_requests.post("https://api.spotify.com/v1/me/player/next",
-                                   headers=headers, timeout=5)
-        return jsonify({"success": resp.status_code in (200, 204)})
-    except Exception as exc:
-        return jsonify({"success": False, "error": str(exc)}), 500
+    return _spotify_playback_action("post", "next")
 
 
 @app.route("/api/spotify/previous", methods=["POST"])
 def api_spotify_previous():
     """Skip to previous track."""
-    headers = _spotify_get_headers()
-    if not headers:
-        return jsonify({"success": False, "error": "Not connected to Spotify"}), 401
-    try:
-        resp = http_requests.post("https://api.spotify.com/v1/me/player/previous",
-                                   headers=headers, timeout=5)
-        return jsonify({"success": resp.status_code in (200, 204)})
-    except Exception as exc:
-        return jsonify({"success": False, "error": str(exc)}), 500
+    return _spotify_playback_action("post", "previous")
 
 
 @app.route("/api/spotify/disconnect", methods=["POST"])

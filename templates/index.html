@@ -453,6 +453,10 @@
     focusedDeviceIndex: -1,
   };
 
+  // Audio levels: raw values from server + smoothed display values
+  const audioLevels = {};      // device_id -> raw level (0.0-1.0)
+  const audioLevelsSmooth = {}; // device_id -> smoothed display level
+
   const statusBar = document.getElementById("statusBar");
   const ariaLive = document.getElementById("ariaLive");
 
@@ -752,13 +756,19 @@
       const isFocused = idx === state.focusedDeviceIndex;
 
       // Audio level ring (outer pulsing ring showing real-time audio)
-      const level = audioLevels[d.id] || 0;
-      if (level > 0.01 && !isMuted) {
-        const levelRadius = NODE_RADIUS + 4 + level * 18;
+      const rawLevel = audioLevels[d.id] || 0;
+      const prevSmooth = audioLevelsSmooth[d.id] || 0;
+      // Fast attack, slow decay for natural-looking meters
+      const smoothed = rawLevel > prevSmooth
+        ? lerp(prevSmooth, rawLevel, 0.4)
+        : lerp(prevSmooth, rawLevel, 0.12);
+      audioLevelsSmooth[d.id] = smoothed;
+      if (smoothed > 0.01 && !isMuted) {
+        const levelRadius = NODE_RADIUS + 4 + smoothed * 18;
         ctx.beginPath();
         ctx.arc(d.x, d.y, levelRadius, 0, Math.PI * 2);
-        ctx.strokeStyle = `rgba(29, 185, 84, ${0.3 + level * 0.5})`;
-        ctx.lineWidth = 2 + level * 3;
+        ctx.strokeStyle = `rgba(29, 185, 84, ${0.3 + smoothed * 0.5})`;
+        ctx.lineWidth = 2 + smoothed * 3;
         ctx.stroke();
       }
 
@@ -1339,10 +1349,8 @@
   });
 
   // -----------------------------------------------------------------------
-  // Audio Level Visualization
+  // Audio Level & Spotify WebSocket listeners
   // -----------------------------------------------------------------------
-  const audioLevels = {};  // device_id -> current level (0.0-1.0)
-
   if (socket) {
     socket.on("audio_levels", (levels) => {
       for (const [id, level] of Object.entries(levels)) {
@@ -1366,6 +1374,9 @@
   const spotifyProgress = document.getElementById("spotifyProgress");
   const btnSpotifyPlay = document.getElementById("btnSpotifyPlay");
   let spotifyPlaying = false;
+  let spotifyProgressMs = 0;
+  let spotifyDurationMs = 0;
+  let spotifyLastUpdateTs = 0;
 
   function updateSpotifyUI(np) {
     if (!np || !np.track) {
@@ -1389,11 +1400,25 @@
       spotifyArt.style.display = "none";
     }
 
-    if (np.duration_ms > 0) {
-      const pct = Math.min(100, (np.progress_ms / np.duration_ms) * 100);
+    // Store for local interpolation
+    spotifyProgressMs = np.progress_ms || 0;
+    spotifyDurationMs = np.duration_ms || 0;
+    spotifyLastUpdateTs = Date.now();
+
+    if (spotifyDurationMs > 0) {
+      const pct = Math.min(100, (spotifyProgressMs / spotifyDurationMs) * 100);
       spotifyProgress.style.width = pct + "%";
     }
   }
+
+  // Interpolate Spotify progress bar locally (smooth between 3s server updates)
+  setInterval(() => {
+    if (!spotifyPlaying || spotifyDurationMs <= 0) return;
+    const elapsed = Date.now() - spotifyLastUpdateTs;
+    const currentMs = Math.min(spotifyDurationMs, spotifyProgressMs + elapsed);
+    const pct = Math.min(100, (currentMs / spotifyDurationMs) * 100);
+    spotifyProgress.style.width = pct + "%";
+  }, 500);
 
   // Spotify connect button
   document.getElementById("btnSpotifyConnect").addEventListener("click", () => {
@@ -1423,12 +1448,18 @@
     spotifyConnect.classList.remove("hidden");
   });
 
-  // Check Spotify status on load
-  fetch("/api/spotify/status").then(r => r.json()).then(data => {
-    if (data.connected && data.now_playing) {
-      updateSpotifyUI(data.now_playing);
-    }
-  }).catch(() => {});
+  // Check Spotify status on load and poll as HTTP fallback
+  function fetchSpotifyStatus() {
+    fetch("/api/spotify/status").then(r => r.json()).then(data => {
+      if (data.connected && data.now_playing) {
+        updateSpotifyUI(data.now_playing);
+      }
+    }).catch(() => {});
+  }
+  fetchSpotifyStatus();
+  setInterval(() => {
+    if (!socket || !socket.connected) fetchSpotifyStatus();
+  }, 5000);
 
   // -----------------------------------------------------------------------
   // Main loop
