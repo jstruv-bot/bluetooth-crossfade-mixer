@@ -44,13 +44,35 @@ def _init_com():
         pass
 
 
+def _is_render_device(device):
+    """Check if device is a render (playback) device by its endpoint ID prefix."""
+    return device.id and device.id.startswith("{0.0.0.")
+
+
+def _is_bluetooth_device(device):
+    """Check if a pycaw AudioDevice is a Bluetooth device.
+
+    Uses PKEY_Device_EnumeratorName ({A45C254E-...}, 24) which is
+    'BTHENUM' for A2DP Bluetooth and 'BTHHFENUM' for Hands-Free.
+    """
+    if not hasattr(device, 'properties') or not device.properties:
+        return False
+    # Check the enumerator name property directly
+    ENUMERATOR_KEY = "{A45C254E-DF1C-4EFD-8020-67D146A850E0} 24"
+    enumerator = device.properties.get(ENUMERATOR_KEY, "")
+    if isinstance(enumerator, str) and enumerator.upper().startswith("BTH"):
+        return True
+    # Fallback: scan all string property values for BT indicators
+    for value in device.properties.values():
+        if isinstance(value, str) and "BTH" in value.upper():
+            return True
+    return False
+
+
 def get_bluetooth_speakers():
     """
-    Enumerate all active audio *render* (playback) devices and return a list
-    of dicts with id, name, and current volume.
-
-    Includes all playback devices (not just Bluetooth) so the app remains
-    useful even without BT speakers connected.
+    Enumerate active Bluetooth audio render (playback) devices and return
+    a list of dicts with id, name, and current volume.
     """
     _init_com()
     devices_info = []
@@ -63,6 +85,14 @@ def get_bluetooth_speakers():
 
     for device in all_devices:
         try:
+            # Only include render (output) devices
+            if not _is_render_device(device):
+                continue
+
+            # Only include Bluetooth devices
+            if not _is_bluetooth_device(device):
+                continue
+
             # Attempt to read the friendly name; skip unnamed devices.
             friendly_name = device.FriendlyName
             if not friendly_name:
