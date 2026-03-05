@@ -7,6 +7,10 @@ Features: crossfade curves, mute, presets, groups, WebSocket, EQ,
 
 import html
 import logging
+import warnings
+
+# Suppress pycaw COMError warnings when reading optional device properties
+warnings.filterwarnings("ignore", message="COMError", category=UserWarning, module="pycaw")
 import webbrowser
 import threading
 import os
