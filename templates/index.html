@@ -200,6 +200,99 @@
     position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
     overflow: hidden; clip: rect(0,0,0,0); border: 0;
   }
+
+  /* Spotify panel */
+  .spotify-bar {
+    margin-top: 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: #16213e;
+    border: 1px solid #0f3460;
+    border-radius: 8px;
+    padding: 8px 14px;
+    max-width: 560px;
+    width: 100%;
+    min-height: 56px;
+  }
+  .spotify-bar.hidden { display: none; }
+  .spotify-art {
+    width: 44px; height: 44px;
+    border-radius: 4px;
+    object-fit: cover;
+    flex-shrink: 0;
+    background: #1a1a2e;
+  }
+  .spotify-info {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .spotify-track {
+    font-size: 0.82rem;
+    color: #fff;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .spotify-artist {
+    font-size: 0.72rem;
+    color: #888;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .spotify-progress-bar {
+    width: 100%;
+    height: 3px;
+    background: #0f3460;
+    border-radius: 2px;
+    margin-top: 4px;
+    overflow: hidden;
+  }
+  .spotify-progress-fill {
+    height: 100%;
+    background: #1db954;
+    border-radius: 2px;
+    transition: width 1s linear;
+  }
+  .spotify-controls {
+    display: flex;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+  .spotify-controls button {
+    background: transparent;
+    border: 1px solid #0f3460;
+    color: #ccc;
+    width: 30px; height: 30px;
+    border-radius: 50%;
+    font-size: 0.85rem;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    transition: background 0.2s, color 0.2s;
+  }
+  .spotify-controls button:hover { background: #0f3460; color: #1db954; }
+  .spotify-connect-btn {
+    background: #1db954 !important;
+    color: #fff !important;
+    border-color: #1db954 !important;
+    border-radius: 6px !important;
+    width: auto !important;
+    padding: 6px 12px !important;
+    font-size: 0.78rem !important;
+  }
+  .spotify-connect-btn:hover { background: #1ed760 !important; }
+  .spotify-disconnect {
+    font-size: 0.7rem;
+    color: #666;
+    cursor: pointer;
+    margin-left: 4px;
+  }
+  .spotify-disconnect:hover { color: #ff6b6b; }
 </style>
 </head>
 <body>
@@ -222,6 +315,32 @@
     <option value="equal-power">Equal Power</option>
   </select>
   <button id="btnCenterReset" aria-label="Reset control point to center">Center</button>
+</div>
+
+<!-- Spotify Now Playing Bar -->
+<div id="spotifyBar" class="spotify-bar hidden">
+  <img id="spotifyArt" class="spotify-art" src="" alt="Album art">
+  <div class="spotify-info">
+    <div id="spotifyTrack" class="spotify-track">Not playing</div>
+    <div id="spotifyArtist" class="spotify-artist"></div>
+    <div class="spotify-progress-bar">
+      <div id="spotifyProgress" class="spotify-progress-fill" style="width: 0%"></div>
+    </div>
+  </div>
+  <div class="spotify-controls" id="spotifyControls">
+    <button id="btnSpotifyPrev" title="Previous track">&#9664;&#9664;</button>
+    <button id="btnSpotifyPlay" title="Play/Pause">&#9654;</button>
+    <button id="btnSpotifyNext" title="Next track">&#9654;&#9654;</button>
+  </div>
+  <span id="btnSpotifyDisconnect" class="spotify-disconnect" title="Disconnect Spotify">&#10005;</span>
+</div>
+
+<!-- Spotify Connect (shown when not connected) -->
+<div id="spotifyConnect" class="spotify-bar">
+  <div class="spotify-info">
+    <div class="spotify-track" style="color: #888; font-size: 0.78rem;">Connect Spotify for now-playing display & playback controls</div>
+  </div>
+  <button id="btnSpotifyConnect" class="spotify-connect-btn" title="Connect to Spotify">Connect Spotify</button>
 </div>
 
 <div id="statusBar" class="status-bar">
@@ -631,6 +750,17 @@
       d.displayVol = lerp(d.displayVol ?? 0, target, 0.15);
       const vol = d.displayVol;
       const isFocused = idx === state.focusedDeviceIndex;
+
+      // Audio level ring (outer pulsing ring showing real-time audio)
+      const level = audioLevels[d.id] || 0;
+      if (level > 0.01 && !isMuted) {
+        const levelRadius = NODE_RADIUS + 4 + level * 18;
+        ctx.beginPath();
+        ctx.arc(d.x, d.y, levelRadius, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(29, 185, 84, ${0.3 + level * 0.5})`;
+        ctx.lineWidth = 2 + level * 3;
+        ctx.stroke();
+      }
 
       // Glow
       if (vol > 0.01 && !isMuted) {
@@ -1207,6 +1337,98 @@
       }
     } catch { /* ignore */ }
   });
+
+  // -----------------------------------------------------------------------
+  // Audio Level Visualization
+  // -----------------------------------------------------------------------
+  const audioLevels = {};  // device_id -> current level (0.0-1.0)
+
+  if (socket) {
+    socket.on("audio_levels", (levels) => {
+      for (const [id, level] of Object.entries(levels)) {
+        audioLevels[id] = level;
+      }
+    });
+
+    socket.on("spotify_now_playing", (np) => {
+      updateSpotifyUI(np);
+    });
+  }
+
+  // -----------------------------------------------------------------------
+  // Spotify UI
+  // -----------------------------------------------------------------------
+  const spotifyBar = document.getElementById("spotifyBar");
+  const spotifyConnect = document.getElementById("spotifyConnect");
+  const spotifyTrack = document.getElementById("spotifyTrack");
+  const spotifyArtist = document.getElementById("spotifyArtist");
+  const spotifyArt = document.getElementById("spotifyArt");
+  const spotifyProgress = document.getElementById("spotifyProgress");
+  const btnSpotifyPlay = document.getElementById("btnSpotifyPlay");
+  let spotifyPlaying = false;
+
+  function updateSpotifyUI(np) {
+    if (!np || !np.track) {
+      spotifyBar.classList.add("hidden");
+      spotifyConnect.classList.remove("hidden");
+      return;
+    }
+    spotifyBar.classList.remove("hidden");
+    spotifyConnect.classList.add("hidden");
+
+    spotifyTrack.textContent = np.track || "Unknown";
+    spotifyArtist.textContent = np.artist || "";
+    spotifyPlaying = np.is_playing;
+    btnSpotifyPlay.innerHTML = np.is_playing ? "&#9646;&#9646;" : "&#9654;";
+    btnSpotifyPlay.title = np.is_playing ? "Pause" : "Play";
+
+    if (np.album_art) {
+      spotifyArt.src = np.album_art;
+      spotifyArt.style.display = "";
+    } else {
+      spotifyArt.style.display = "none";
+    }
+
+    if (np.duration_ms > 0) {
+      const pct = Math.min(100, (np.progress_ms / np.duration_ms) * 100);
+      spotifyProgress.style.width = pct + "%";
+    }
+  }
+
+  // Spotify connect button
+  document.getElementById("btnSpotifyConnect").addEventListener("click", () => {
+    const clientId = prompt("Enter your Spotify Client ID:\n(Create one at https://developer.spotify.com/dashboard)");
+    if (clientId && clientId.trim()) {
+      window.location.href = "/api/spotify/login?client_id=" + encodeURIComponent(clientId.trim());
+    }
+  });
+
+  // Spotify playback controls
+  btnSpotifyPlay.addEventListener("click", async () => {
+    const endpoint = spotifyPlaying ? "/api/spotify/pause" : "/api/spotify/play";
+    try { await fetch(endpoint, { method: "POST" }); } catch { /* ignore */ }
+  });
+
+  document.getElementById("btnSpotifyPrev").addEventListener("click", async () => {
+    try { await fetch("/api/spotify/previous", { method: "POST" }); } catch { /* ignore */ }
+  });
+
+  document.getElementById("btnSpotifyNext").addEventListener("click", async () => {
+    try { await fetch("/api/spotify/next", { method: "POST" }); } catch { /* ignore */ }
+  });
+
+  document.getElementById("btnSpotifyDisconnect").addEventListener("click", async () => {
+    try { await fetch("/api/spotify/disconnect", { method: "POST" }); } catch { /* ignore */ }
+    spotifyBar.classList.add("hidden");
+    spotifyConnect.classList.remove("hidden");
+  });
+
+  // Check Spotify status on load
+  fetch("/api/spotify/status").then(r => r.json()).then(data => {
+    if (data.connected && data.now_playing) {
+      updateSpotifyUI(data.now_playing);
+    }
+  }).catch(() => {});
 
   // -----------------------------------------------------------------------
   // Main loop

@@ -411,5 +411,138 @@ class TestValidateDeviceId(unittest.TestCase):
         self.assertFalse(server._validate_device_id(None))
 
 
+class TestSpotifyAPI(unittest.TestCase):
+    def setUp(self):
+        server.app.testing = True
+        server.app.config["SECRET_KEY"] = "test-secret"
+        self.client = server.app.test_client()
+        # Reset Spotify state
+        with server._spotify_lock:
+            server._spotify_tokens["access_token"] = None
+            server._spotify_tokens["refresh_token"] = None
+            server._spotify_tokens["expires_at"] = 0
+            server._spotify_tokens["client_id"] = ""
+
+    def test_spotify_status_disconnected(self):
+        resp = self.client.get("/api/spotify/status")
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.data)
+        self.assertFalse(data["connected"])
+
+    def test_spotify_status_connected(self):
+        import time
+        with server._spotify_lock:
+            server._spotify_tokens["access_token"] = "test_token"
+            server._spotify_tokens["expires_at"] = time.time() + 3600
+        resp = self.client.get("/api/spotify/status")
+        data = json.loads(resp.data)
+        self.assertTrue(data["connected"])
+
+    def test_spotify_now_playing_default(self):
+        resp = self.client.get("/api/spotify/now-playing")
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.data)
+        self.assertFalse(data["is_playing"])
+
+    def test_spotify_play_unauthorized(self):
+        resp = self.client.post("/api/spotify/play")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_spotify_pause_unauthorized(self):
+        resp = self.client.post("/api/spotify/pause")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_spotify_next_unauthorized(self):
+        resp = self.client.post("/api/spotify/next")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_spotify_previous_unauthorized(self):
+        resp = self.client.post("/api/spotify/previous")
+        self.assertEqual(resp.status_code, 401)
+
+    def test_spotify_disconnect(self):
+        import time
+        with server._spotify_lock:
+            server._spotify_tokens["access_token"] = "test_token"
+            server._spotify_tokens["expires_at"] = time.time() + 3600
+        resp = self.client.post("/api/spotify/disconnect")
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(json.loads(resp.data)["success"])
+        # Verify tokens cleared
+        with server._spotify_lock:
+            self.assertIsNone(server._spotify_tokens["access_token"])
+
+    def test_spotify_login_no_client_id(self):
+        # No client_id and no env var
+        resp = self.client.get("/api/spotify/login")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_spotify_login_with_client_id(self):
+        resp = self.client.get("/api/spotify/login?client_id=test_client_123")
+        # Should redirect to Spotify authorize page
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn("accounts.spotify.com/authorize", resp.headers["Location"])
+
+    def test_spotify_callback_no_code(self):
+        resp = self.client.get("/api/spotify/callback")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_spotify_callback_error(self):
+        resp = self.client.get("/api/spotify/callback?error=access_denied")
+        self.assertEqual(resp.status_code, 400)
+
+
+class TestAudioLevelsAPI(unittest.TestCase):
+    def setUp(self):
+        server.app.testing = True
+        self.client = server.app.test_client()
+
+    def test_get_levels(self):
+        with server._levels_lock:
+            server._audio_levels.clear()
+            server._audio_levels["dev1"] = 0.5
+        resp = self.client.get("/api/levels")
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.data)
+        self.assertEqual(data["dev1"], 0.5)
+
+    def test_get_levels_empty(self):
+        with server._levels_lock:
+            server._audio_levels.clear()
+        resp = self.client.get("/api/levels")
+        self.assertEqual(resp.status_code, 200)
+        data = json.loads(resp.data)
+        self.assertEqual(data, {})
+
+
+class TestSpotifyHelpers(unittest.TestCase):
+    def test_pkce_generation(self):
+        verifier, challenge = server._spotify_generate_pkce()
+        self.assertIsInstance(verifier, str)
+        self.assertIsInstance(challenge, str)
+        self.assertGreater(len(verifier), 40)
+        self.assertGreater(len(challenge), 20)
+        # Challenge should not contain padding
+        self.assertNotIn("=", challenge)
+
+    def test_token_valid_when_expired(self):
+        with server._spotify_lock:
+            server._spotify_tokens["access_token"] = "test"
+            server._spotify_tokens["expires_at"] = 0
+        self.assertFalse(server._spotify_token_valid())
+
+    def test_token_valid_when_none(self):
+        with server._spotify_lock:
+            server._spotify_tokens["access_token"] = None
+        self.assertFalse(server._spotify_token_valid())
+
+    def test_token_valid_when_fresh(self):
+        import time
+        with server._spotify_lock:
+            server._spotify_tokens["access_token"] = "test"
+            server._spotify_tokens["expires_at"] = time.time() + 3600
+        self.assertTrue(server._spotify_token_valid())
+
+
 if __name__ == "__main__":
     unittest.main()

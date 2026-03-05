@@ -1,20 +1,35 @@
 """
 Bluetooth Speaker Crossfade Mixer — Backend
 Flask API + pycaw device enumeration for per-device volume control.
-Features: crossfade curves, mute, presets, groups, WebSocket, EQ, auto-reconnect.
+Features: crossfade curves, mute, presets, groups, WebSocket, EQ,
+          auto-reconnect, Spotify integration, audio level metering.
 """
 
 import logging
 import webbrowser
 import threading
 import os
-from flask import Flask, render_template, jsonify, request
+import time
+import hashlib
+import secrets
+import base64
+import urllib.parse
+from flask import Flask, render_template, jsonify, request, redirect, session
 from flask_socketio import SocketIO, emit
+import requests as http_requests
 
 # pycaw / COM imports for Windows Core Audio
 import comtypes
 from pycaw.pycaw import AudioUtilities
 from pycaw.constants import EDataFlow, DEVICE_STATE
+
+# IAudioMeterInformation for audio level metering
+try:
+    from comtypes import GUID
+    _IID_IAudioMeterInformation = GUID("{C02216F6-8C67-4B5B-9D00-D008E73E0064}")
+    _METER_AVAILABLE = True
+except Exception:
+    _METER_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -62,6 +77,35 @@ _eq_lock = threading.Lock()
 # Previous device set for detecting reconnections
 _previous_device_ids = set()
 _prev_lock = threading.Lock()
+
+# Audio level cache: {device_id: float (0.0-1.0)}
+_audio_levels = {}
+_levels_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Spotify state
+# ---------------------------------------------------------------------------
+
+_SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "")
+_SPOTIFY_REDIRECT_URI = "http://127.0.0.1:5123/api/spotify/callback"
+_SPOTIFY_SCOPES = "user-read-playback-state user-modify-playback-state user-read-currently-playing"
+
+_spotify_lock = threading.Lock()
+_spotify_tokens = {
+    "access_token": None,
+    "refresh_token": None,
+    "expires_at": 0,
+    "client_id": "",
+}
+_spotify_now_playing = {
+    "is_playing": False,
+    "track": None,
+    "artist": None,
+    "album": None,
+    "album_art": None,
+    "progress_ms": 0,
+    "duration_ms": 0,
+}
 
 # ---------------------------------------------------------------------------
 # Device enumeration helpers
@@ -273,6 +317,144 @@ def set_volumes_batch(volumes):
 def _validate_device_id(device_id):
     """Return True if device_id is a valid string within length limits."""
     return isinstance(device_id, str) and 0 < len(device_id) <= _MAX_DEVICE_ID_LEN
+
+
+def get_audio_levels():
+    """Read peak audio levels for all active render devices via IAudioMeterInformation."""
+    levels = {}
+    if not _METER_AVAILABLE:
+        return levels
+
+    try:
+        all_devices = _get_active_render_devices()
+    except Exception:
+        return levels
+
+    for device in all_devices:
+        try:
+            # Activate IAudioMeterInformation on the device endpoint
+            meter = device.EndpointVolume  # fallback — try to get meter info
+            try:
+                endpoint = device._dev
+                meter_info = endpoint.Activate(_IID_IAudioMeterInformation, 0, None)
+                peak = meter_info.GetPeakValue()
+                levels[device.id] = round(max(0.0, min(1.0, peak)), 4)
+            except Exception:
+                levels[device.id] = 0.0
+        except Exception:
+            continue
+
+    with _levels_lock:
+        _audio_levels.clear()
+        _audio_levels.update(levels)
+
+    return levels
+
+
+# ---------------------------------------------------------------------------
+# Spotify helpers
+# ---------------------------------------------------------------------------
+
+
+def _spotify_generate_pkce():
+    """Generate PKCE code verifier and challenge."""
+    verifier = secrets.token_urlsafe(64)[:128]
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+def _spotify_token_valid():
+    """Check if we have a valid (non-expired) Spotify access token."""
+    with _spotify_lock:
+        return (_spotify_tokens["access_token"] is not None
+                and time.time() < _spotify_tokens["expires_at"])
+
+
+def _spotify_refresh():
+    """Refresh the Spotify access token using the refresh token."""
+    with _spotify_lock:
+        refresh_token = _spotify_tokens.get("refresh_token")
+        client_id = _spotify_tokens.get("client_id") or _SPOTIFY_CLIENT_ID
+
+    if not refresh_token or not client_id:
+        return False
+
+    try:
+        resp = http_requests.post("https://accounts.spotify.com/api/token", data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+        }, timeout=10)
+
+        if resp.status_code != 200:
+            log.warning("Spotify token refresh failed: %s", resp.text)
+            return False
+
+        data = resp.json()
+        with _spotify_lock:
+            _spotify_tokens["access_token"] = data["access_token"]
+            _spotify_tokens["expires_at"] = time.time() + data.get("expires_in", 3600) - 60
+            if "refresh_token" in data:
+                _spotify_tokens["refresh_token"] = data["refresh_token"]
+        return True
+    except Exception as exc:
+        log.error("Spotify refresh error: %s", exc)
+        return False
+
+
+def _spotify_get_headers():
+    """Return Authorization header dict, refreshing token if needed."""
+    if not _spotify_token_valid():
+        _spotify_refresh()
+    with _spotify_lock:
+        token = _spotify_tokens.get("access_token")
+    if not token:
+        return None
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _spotify_poll_now_playing():
+    """Poll Spotify for the current playback state."""
+    headers = _spotify_get_headers()
+    if not headers:
+        return
+
+    try:
+        resp = http_requests.get(
+            "https://api.spotify.com/v1/me/player/currently-playing",
+            headers=headers, timeout=5)
+
+        if resp.status_code == 204 or resp.status_code == 401:
+            with _spotify_lock:
+                _spotify_now_playing["is_playing"] = False
+                _spotify_now_playing["track"] = None
+            return
+
+        if resp.status_code != 200:
+            return
+
+        data = resp.json()
+        item = data.get("item")
+        if not item:
+            return
+
+        artists = ", ".join(a["name"] for a in item.get("artists", []))
+        images = item.get("album", {}).get("images", [])
+        art_url = images[0]["url"] if images else None
+
+        with _spotify_lock:
+            _spotify_now_playing.update({
+                "is_playing": data.get("is_playing", False),
+                "track": item.get("name"),
+                "artist": artists,
+                "album": item.get("album", {}).get("name"),
+                "album_art": art_url,
+                "progress_ms": data.get("progress_ms", 0),
+                "duration_ms": item.get("duration_ms", 0),
+            })
+    except Exception as exc:
+        log.error("Spotify poll error: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +687,175 @@ def api_eq_get(device_id):
 
 
 # ---------------------------------------------------------------------------
+# Spotify API routes
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/spotify/login")
+def api_spotify_login():
+    """Initiate Spotify OAuth 2.0 PKCE login flow."""
+    client_id = request.args.get("client_id", "").strip() or _SPOTIFY_CLIENT_ID
+    if not client_id:
+        return jsonify({"success": False, "error": "No Spotify client_id provided. Set SPOTIFY_CLIENT_ID env var or pass ?client_id=..."}), 400
+
+    verifier, challenge = _spotify_generate_pkce()
+    # Store PKCE verifier and client_id in server-side session
+    session["spotify_pkce_verifier"] = verifier
+    session["spotify_client_id"] = client_id
+
+    params = urllib.parse.urlencode({
+        "response_type": "code",
+        "client_id": client_id,
+        "scope": _SPOTIFY_SCOPES,
+        "redirect_uri": _SPOTIFY_REDIRECT_URI,
+        "code_challenge_method": "S256",
+        "code_challenge": challenge,
+    })
+    return redirect(f"https://accounts.spotify.com/authorize?{params}")
+
+
+@app.route("/api/spotify/callback")
+def api_spotify_callback():
+    """Handle Spotify OAuth callback — exchange code for tokens."""
+    code = request.args.get("code")
+    error = request.args.get("error")
+
+    if error:
+        return f"<h2>Spotify auth error: {error}</h2><p><a href='/'>Back to mixer</a></p>", 400
+
+    if not code:
+        return "<h2>Missing authorization code</h2><p><a href='/'>Back to mixer</a></p>", 400
+
+    verifier = session.get("spotify_pkce_verifier")
+    client_id = session.get("spotify_client_id", _SPOTIFY_CLIENT_ID)
+
+    if not verifier:
+        return "<h2>Session expired — please login again</h2><p><a href='/'>Back to mixer</a></p>", 400
+
+    try:
+        resp = http_requests.post("https://accounts.spotify.com/api/token", data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": _SPOTIFY_REDIRECT_URI,
+            "client_id": client_id,
+            "code_verifier": verifier,
+        }, timeout=10)
+
+        if resp.status_code != 200:
+            log.warning("Spotify token exchange failed: %s", resp.text)
+            return f"<h2>Token exchange failed</h2><pre>{resp.text}</pre><p><a href='/'>Back to mixer</a></p>", 400
+
+        data = resp.json()
+        with _spotify_lock:
+            _spotify_tokens["access_token"] = data["access_token"]
+            _spotify_tokens["refresh_token"] = data.get("refresh_token")
+            _spotify_tokens["expires_at"] = time.time() + data.get("expires_in", 3600) - 60
+            _spotify_tokens["client_id"] = client_id
+
+        log.info("Spotify authenticated successfully")
+        # Redirect back to the mixer UI
+        return redirect("/")
+
+    except Exception as exc:
+        log.error("Spotify callback error: %s", exc)
+        return f"<h2>Error: {exc}</h2><p><a href='/'>Back to mixer</a></p>", 500
+
+
+@app.route("/api/spotify/status")
+def api_spotify_status():
+    """Return Spotify connection status."""
+    connected = _spotify_token_valid()
+    with _spotify_lock:
+        np = dict(_spotify_now_playing) if connected else {}
+    return jsonify({"connected": connected, "now_playing": np})
+
+
+@app.route("/api/spotify/now-playing")
+def api_spotify_now_playing():
+    """Return current Spotify now-playing info."""
+    with _spotify_lock:
+        return jsonify(_spotify_now_playing)
+
+
+@app.route("/api/spotify/play", methods=["POST"])
+def api_spotify_play():
+    """Resume Spotify playback."""
+    headers = _spotify_get_headers()
+    if not headers:
+        return jsonify({"success": False, "error": "Not connected to Spotify"}), 401
+    try:
+        resp = http_requests.put("https://api.spotify.com/v1/me/player/play",
+                                  headers=headers, timeout=5)
+        return jsonify({"success": resp.status_code in (200, 204)})
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+@app.route("/api/spotify/pause", methods=["POST"])
+def api_spotify_pause():
+    """Pause Spotify playback."""
+    headers = _spotify_get_headers()
+    if not headers:
+        return jsonify({"success": False, "error": "Not connected to Spotify"}), 401
+    try:
+        resp = http_requests.put("https://api.spotify.com/v1/me/player/pause",
+                                  headers=headers, timeout=5)
+        return jsonify({"success": resp.status_code in (200, 204)})
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+@app.route("/api/spotify/next", methods=["POST"])
+def api_spotify_next():
+    """Skip to next track."""
+    headers = _spotify_get_headers()
+    if not headers:
+        return jsonify({"success": False, "error": "Not connected to Spotify"}), 401
+    try:
+        resp = http_requests.post("https://api.spotify.com/v1/me/player/next",
+                                   headers=headers, timeout=5)
+        return jsonify({"success": resp.status_code in (200, 204)})
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+@app.route("/api/spotify/previous", methods=["POST"])
+def api_spotify_previous():
+    """Skip to previous track."""
+    headers = _spotify_get_headers()
+    if not headers:
+        return jsonify({"success": False, "error": "Not connected to Spotify"}), 401
+    try:
+        resp = http_requests.post("https://api.spotify.com/v1/me/player/previous",
+                                   headers=headers, timeout=5)
+        return jsonify({"success": resp.status_code in (200, 204)})
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+@app.route("/api/spotify/disconnect", methods=["POST"])
+def api_spotify_disconnect():
+    """Disconnect from Spotify (clear tokens)."""
+    with _spotify_lock:
+        _spotify_tokens["access_token"] = None
+        _spotify_tokens["refresh_token"] = None
+        _spotify_tokens["expires_at"] = 0
+    return jsonify({"success": True})
+
+
+# ---------------------------------------------------------------------------
+# Audio Levels API
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/levels")
+def api_levels():
+    """Return current peak audio levels for all devices."""
+    with _levels_lock:
+        return jsonify(_audio_levels)
+
+
+# ---------------------------------------------------------------------------
 # WebSocket events
 # ---------------------------------------------------------------------------
 
@@ -576,6 +927,37 @@ def _device_monitor():
         socketio.sleep(_monitor_interval)
 
 
+def _audio_level_monitor():
+    """Push per-device audio levels via WebSocket at ~10fps."""
+    while True:
+        try:
+            levels = get_audio_levels()
+            if levels:
+                socketio.emit("audio_levels", levels)
+        except Exception as exc:
+            log.error("Audio level monitor error: %s", exc)
+        socketio.sleep(0.1)  # ~10fps
+
+
+def _spotify_monitor():
+    """Poll Spotify now-playing and push updates via WebSocket."""
+    prev_track = None
+    while True:
+        try:
+            if _spotify_token_valid():
+                _spotify_poll_now_playing()
+                with _spotify_lock:
+                    np = dict(_spotify_now_playing)
+                # Only emit when something changes
+                track_key = (np.get("track"), np.get("artist"), np.get("is_playing"))
+                if track_key != prev_track:
+                    prev_track = track_key
+                    socketio.emit("spotify_now_playing", np)
+        except Exception as exc:
+            log.error("Spotify monitor error: %s", exc)
+        socketio.sleep(3.0)
+
+
 # ---------------------------------------------------------------------------
 # Application entry point
 # ---------------------------------------------------------------------------
@@ -587,8 +969,10 @@ if __name__ == "__main__":
 
     log.info("Starting Bluetooth Crossfade Mixer server at %s", url)
 
-    # Start background device monitor
+    # Start background monitors
     socketio.start_background_task(_device_monitor)
+    socketio.start_background_task(_audio_level_monitor)
+    socketio.start_background_task(_spotify_monitor)
 
     # Open the browser after a short delay so the server is ready.
     threading.Timer(1.5, lambda: webbrowser.open(url)).start()
