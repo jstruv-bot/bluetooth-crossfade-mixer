@@ -1,0 +1,4829 @@
+From ddc63e22404c599a5c690819e187db9d1fdf76f6 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Mar 2026 22:51:34 +0000
+Subject: [PATCH 1/6] refactor: optimize backend, add frontend UI and tests
+
+- Fix set_device_volume to filter only active render devices (was scanning all devices)
+- Add batch volume endpoint (POST /api/volume/batch) to reduce HTTP calls during crossfade
+- Add proper input validation on device_id (type check + length limit)
+- Replace print statements with structured logging
+- Optimize COM init with thread-local tracking (avoid repeated CoInitialize calls)
+- Remove unused imports (CLSCTX_ALL, IAudioEndpointVolume)
+- Create full radial mixer frontend with canvas-based UI, drag interaction,
+  inverse-distance volume weighting, glow effects, and setup guide
+- Add 17 unit tests covering all API routes and volume control logic
+- Expand .gitignore for Python/IDE artifacts
+- Remove placeholder hello-world test file
+
+https://claude.ai/code/session_01S7VjSQ7Bf5X2V5UZjp8yoZ
+---
+ .gitignore           |  14 ++
+ server.py            | 184 +++++++++++-----
+ templates/index.html | 508 +++++++++++++++++++++++++++++++++++++++++++
+ test                 |   8 -
+ test_server.py       | 189 ++++++++++++++++
+ 5 files changed, 840 insertions(+), 63 deletions(-)
+ create mode 100644 templates/index.html
+ delete mode 100644 test
+ create mode 100644 test_server.py
+
+diff --git a/.gitignore b/.gitignore
+index c18dd8d..4082b52 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1 +1,15 @@
+ __pycache__/
++*.pyc
++*.pyo
++*.egg-info/
++dist/
++build/
++.env
++.venv/
++venv/
++*.log
++.idea/
++.vscode/
++*.swp
++*.swo
++*~
+diff --git a/server.py b/server.py
+index 3bc43e9..f43e445 100644
+--- a/server.py
++++ b/server.py
+@@ -3,78 +3,85 @@ Bluetooth Speaker Crossfade Mixer — Backend
+ Flask API + pycaw device enumeration for per-device volume control.
+ """
+ 
++import logging
+ import webbrowser
+ import threading
+ from flask import Flask, render_template, jsonify, request
+ 
+ # pycaw / COM imports for Windows Core Audio
+ import comtypes
+-from comtypes import CLSCTX_ALL
+-from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
++from pycaw.pycaw import AudioUtilities
+ from pycaw.constants import EDataFlow, DEVICE_STATE
+ 
++# ---------------------------------------------------------------------------
++# Logging
++# ---------------------------------------------------------------------------
++
++logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
++log = logging.getLogger(__name__)
++
+ # ---------------------------------------------------------------------------
+ # Flask app setup
+ # ---------------------------------------------------------------------------
+ 
+ app = Flask(__name__, template_folder="templates")
+ 
++# Thread-local storage for COM initialization tracking
++_com_initialized = threading.local()
++
+ # ---------------------------------------------------------------------------
+ # Device enumeration helpers
+ # ---------------------------------------------------------------------------
+ 
++# Maximum length for device_id strings to prevent abuse
++_MAX_DEVICE_ID_LEN = 512
++
+ 
+ def _init_com():
+-    """Initialize COM for the current thread. Safe to call multiple times."""
+-    try:
+-        comtypes.CoInitialize()
+-    except OSError:
+-        # COM already initialized on this thread — that is fine.
+-        pass
++    """Initialize COM for the current thread (once per thread)."""
++    if not getattr(_com_initialized, "done", False):
++        try:
++            comtypes.CoInitialize()
++        except OSError:
++            pass
++        _com_initialized.done = True
++
++
++def _get_active_render_devices():
++    """Return the list of active render (playback) devices."""
++    _init_com()
++    return AudioUtilities.GetAllDevices(
++        data_flow=EDataFlow.eRender.value,
++        device_state=DEVICE_STATE.ACTIVE.value,
++    )
+ 
+ 
+-def get_bluetooth_speakers():
++def get_playback_devices():
+     """
+     Enumerate all active audio *render* (playback) devices and return a list
+     of dicts with id, name, and current volume.
+-
+-    Includes all playback devices (not just Bluetooth) so the app remains
+-    useful even without BT speakers connected.
+     """
+-    _init_com()
+     devices_info = []
+ 
+     try:
+-        # Request only active render (playback) devices from the enumerator.
+-        all_devices = AudioUtilities.GetAllDevices(
+-            data_flow=EDataFlow.eRender.value,
+-            device_state=DEVICE_STATE.ACTIVE.value,
+-        )
++        all_devices = _get_active_render_devices()
+     except Exception as exc:
+-        print(f"[enumerate] Failed to list devices: {exc}")
++        log.error("Failed to list devices: %s", exc)
+         return devices_info
+ 
+     for device in all_devices:
+         try:
+-            # Attempt to read the friendly name; skip unnamed devices.
+             friendly_name = device.FriendlyName
+-            if not friendly_name:
+-                continue
+-
+-            # Obtain a unique device id string.
+             device_id = device.id
+-            if not device_id:
++            if not friendly_name or not device_id:
+                 continue
+ 
+-            # Try to get the IAudioEndpointVolume interface to read volume.
+-            # The pycaw AudioDevice property is named "EndpointVolume".
+             volume_level = None
+             try:
+                 endpoint_volume = device.EndpointVolume
+                 if endpoint_volume is not None:
+                     volume_level = endpoint_volume.GetMasterVolumeLevelScalar()
+             except Exception:
+-                # Device may not support volume — that is acceptable.
+                 pass
+ 
+             devices_info.append({
+@@ -84,8 +91,7 @@ def get_bluetooth_speakers():
+             })
+ 
+         except Exception as exc:
+-            # Individual device failure must not crash the scan.
+-            print(f"[enumerate] Skipping device: {exc}")
++            log.warning("Skipping device: %s", exc)
+             continue
+ 
+     return devices_info
+@@ -95,24 +101,14 @@ def set_device_volume(device_id, volume):
+     """
+     Set the master volume on the device identified by *device_id*.
+ 
+-    Parameters
+-    ----------
+-    device_id : str
+-        The Windows endpoint ID string returned by ``get_bluetooth_speakers()``.
+-    volume : float
+-        Desired volume level, clamped to the range 0.0 -- 1.0.
+-
+     Returns True on success, False on failure.
+     """
+-    _init_com()
+-
+-    # Clamp to [0.0, 1.0]
+     volume = max(0.0, min(1.0, float(volume)))
+ 
+     try:
+-        all_devices = AudioUtilities.GetAllDevices()
++        all_devices = _get_active_render_devices()
+     except Exception as exc:
+-        print(f"[set_volume] Failed to enumerate devices: {exc}")
++        log.error("Failed to enumerate devices: %s", exc)
+         return False
+ 
+     for device in all_devices:
+@@ -120,18 +116,67 @@ def set_device_volume(device_id, volume):
+             if device.id == device_id:
+                 endpoint_volume = device.EndpointVolume
+                 if endpoint_volume is None:
+-                    print(f"[set_volume] Device has no volume interface: {device_id}")
++                    log.warning("Device has no volume interface: %s", device_id)
+                     return False
+                 endpoint_volume.SetMasterVolumeLevelScalar(volume, None)
+                 return True
+         except Exception as exc:
+-            print(f"[set_volume] Error setting volume on {device_id}: {exc}")
++            log.error("Error setting volume on %s: %s", device_id, exc)
+             return False
+ 
+-    print(f"[set_volume] Device not found: {device_id}")
++    log.warning("Device not found: %s", device_id)
+     return False
+ 
+ 
++def set_volumes_batch(volumes):
++    """
++    Set volume on multiple devices in a single enumeration pass.
++
++    Parameters
++    ----------
++    volumes : list[dict]
++        Each dict must have ``device_id`` (str) and ``volume`` (float 0-1).
++
++    Returns a dict mapping device_id -> bool (success/failure).
++    """
++    results = {}
++    lookup = {}
++    for entry in volumes:
++        did = entry.get("device_id")
++        vol = entry.get("volume")
++        if did and vol is not None:
++            lookup[did] = max(0.0, min(1.0, float(vol)))
++
++    if not lookup:
++        return results
++
++    try:
++        all_devices = _get_active_render_devices()
++    except Exception as exc:
++        log.error("Failed to enumerate devices: %s", exc)
++        return {did: False for did in lookup}
++
++    for device in all_devices:
++        try:
++            if device.id in lookup:
++                endpoint_volume = device.EndpointVolume
++                if endpoint_volume is None:
++                    results[device.id] = False
++                else:
++                    endpoint_volume.SetMasterVolumeLevelScalar(lookup[device.id], None)
++                    results[device.id] = True
++        except Exception as exc:
++            log.error("Error setting volume on %s: %s", device.id, exc)
++            results[device.id] = False
++
++    # Mark devices that were requested but not found
++    for did in lookup:
++        if did not in results:
++            results[did] = False
++
++    return results
++
++
+ # ---------------------------------------------------------------------------
+ # Flask routes
+ # ---------------------------------------------------------------------------
+@@ -146,8 +191,7 @@ def index():
+ @app.route("/api/devices", methods=["GET"])
+ def api_devices():
+     """Return the current list of active playback devices as JSON."""
+-    devices = get_bluetooth_speakers()
+-    return jsonify(devices)
++    return jsonify(get_playback_devices())
+ 
+ 
+ @app.route("/api/volume", methods=["POST"])
+@@ -164,8 +208,8 @@ def api_volume():
+     device_id = data.get("device_id")
+     volume = data.get("volume")
+ 
+-    if device_id is None:
+-        return jsonify({"success": False, "error": "Missing 'device_id'"}), 400
++    if not isinstance(device_id, str) or len(device_id) > _MAX_DEVICE_ID_LEN:
++        return jsonify({"success": False, "error": "Invalid 'device_id'"}), 400
+     if volume is None:
+         return jsonify({"success": False, "error": "Missing 'volume'"}), 400
+ 
+@@ -177,15 +221,46 @@ def api_volume():
+     ok = set_device_volume(device_id, volume)
+     if ok:
+         return jsonify({"success": True})
+-    else:
+-        return jsonify({"success": False, "error": "Failed to set volume"}), 500
++    return jsonify({"success": False, "error": "Failed to set volume"}), 500
++
++
++@app.route("/api/volume/batch", methods=["POST"])
++def api_volume_batch():
++    """
++    Set volume on multiple devices in one call.
++
++    Expects JSON body: {"volumes": [{"device_id": "...", "volume": 0.0-1.0}, ...]}
++    """
++    data = request.get_json(silent=True)
++    if not data or "volumes" not in data:
++        return jsonify({"success": False, "error": "Expected JSON with 'volumes' array"}), 400
++
++    volumes = data["volumes"]
++    if not isinstance(volumes, list) or len(volumes) > 20:
++        return jsonify({"success": False, "error": "'volumes' must be an array (max 20)"}), 400
++
++    # Validate entries
++    for entry in volumes:
++        did = entry.get("device_id")
++        vol = entry.get("volume")
++        if not isinstance(did, str) or len(did) > _MAX_DEVICE_ID_LEN:
++            return jsonify({"success": False, "error": f"Invalid device_id in batch"}), 400
++        if vol is None:
++            return jsonify({"success": False, "error": "Missing 'volume' in batch entry"}), 400
++        try:
++            float(vol)
++        except (TypeError, ValueError):
++            return jsonify({"success": False, "error": "'volume' must be a number"}), 400
++
++    results = set_volumes_batch(volumes)
++    all_ok = all(results.values())
++    return jsonify({"success": all_ok, "results": results}), (200 if all_ok else 207)
+ 
+ 
+ @app.route("/api/refresh", methods=["POST"])
+ def api_refresh():
+     """Re-scan devices and return the updated list."""
+-    devices = get_bluetooth_speakers()
+-    return jsonify(devices)
++    return jsonify(get_playback_devices())
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -197,8 +272,7 @@ if __name__ == "__main__":
+     PORT = 5123
+     url = f"http://{HOST}:{PORT}"
+ 
+-    print(f"Starting Bluetooth Crossfade Mixer server at {url}")
+-    print("Press Ctrl+C to stop.\n")
++    log.info("Starting Bluetooth Crossfade Mixer server at %s", url)
+ 
+     # Open the browser after a short delay so the server is ready.
+     threading.Timer(1.5, lambda: webbrowser.open(url)).start()
+diff --git a/templates/index.html b/templates/index.html
+new file mode 100644
+index 0000000..a11520c
+--- /dev/null
++++ b/templates/index.html
+@@ -0,0 +1,508 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++<meta charset="UTF-8">
++<meta name="viewport" content="width=device-width, initial-scale=1.0">
++<title>Bluetooth Crossfade Mixer</title>
++<style>
++  * { margin: 0; padding: 0; box-sizing: border-box; }
++
++  body {
++    background: #1a1a2e;
++    color: #e0e0e0;
++    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
++    display: flex;
++    flex-direction: column;
++    align-items: center;
++    min-height: 100vh;
++    padding: 24px 16px;
++  }
++
++  h1 {
++    font-size: 1.6rem;
++    font-weight: 600;
++    margin-bottom: 6px;
++    color: #ffffff;
++  }
++
++  .subtitle {
++    font-size: 0.85rem;
++    color: #888;
++    margin-bottom: 20px;
++  }
++
++  canvas {
++    border-radius: 50%;
++    box-shadow: 0 0 40px rgba(0, 212, 255, 0.08);
++    cursor: default;
++    touch-action: none;
++  }
++
++  .controls {
++    margin-top: 16px;
++    display: flex;
++    gap: 10px;
++    align-items: center;
++  }
++
++  button {
++    background: #16213e;
++    color: #e0e0e0;
++    border: 1px solid #0f3460;
++    border-radius: 6px;
++    padding: 8px 18px;
++    font-size: 0.85rem;
++    cursor: pointer;
++    transition: background 0.2s, border-color 0.2s;
++  }
++
++  button:hover {
++    background: #0f3460;
++    border-color: #00d4ff;
++  }
++
++  button:active { transform: scale(0.97); }
++
++  .status-bar {
++    margin-top: 10px;
++    font-size: 0.78rem;
++    color: #666;
++    text-align: center;
++    min-height: 1.2em;
++  }
++
++  .status-bar.error { color: #ff6b6b; }
++
++  details {
++    margin-top: 24px;
++    max-width: 500px;
++    width: 100%;
++    background: #16213e;
++    border: 1px solid #0f3460;
++    border-radius: 8px;
++    overflow: hidden;
++  }
++
++  summary {
++    padding: 12px 16px;
++    cursor: pointer;
++    font-size: 0.9rem;
++    font-weight: 500;
++    color: #aaa;
++    user-select: none;
++  }
++
++  summary:hover { color: #e0e0e0; }
++
++  .guide-content {
++    padding: 0 16px 16px;
++    font-size: 0.82rem;
++    line-height: 1.6;
++    color: #999;
++  }
++
++  .guide-content h3 {
++    color: #ccc;
++    font-size: 0.88rem;
++    margin: 12px 0 6px;
++  }
++
++  .guide-content ol, .guide-content ul {
++    padding-left: 20px;
++  }
++
++  .guide-content li { margin-bottom: 4px; }
++  .guide-content code { color: #00d4ff; font-size: 0.82rem; }
++</style>
++</head>
++<body>
++
++<h1>Bluetooth Crossfade Mixer</h1>
++<p class="subtitle">Drag the control point to blend volume between speakers</p>
++
++<canvas id="mixer" width="500" height="500"></canvas>
++
++<div class="controls">
++  <button id="btnRefresh">Refresh Devices</button>
++</div>
++
++<div id="statusBar" class="status-bar">Connecting...</div>
++
++<details>
++  <summary>Setup Guide &mdash; Multi-Output Audio on Windows</summary>
++  <div class="guide-content">
++    <p>Windows only routes audio to one output by default. To send audio to multiple speakers simultaneously, use one of these methods:</p>
++
++    <h3>Method 1: Stereo Mix (Built-in)</h3>
++    <ol>
++      <li>Right-click the speaker icon in the taskbar &rarr; <code>Sounds</code></li>
++      <li>Go to the <code>Recording</code> tab</li>
++      <li>Right-click and enable <code>Show Disabled Devices</code></li>
++      <li>Enable <code>Stereo Mix</code></li>
++      <li>Right-click Stereo Mix &rarr; <code>Properties</code> &rarr; <code>Listen</code> tab</li>
++      <li>Check <code>Listen to this device</code> and select your secondary speaker</li>
++      <li>Click Apply &mdash; audio now plays on both outputs</li>
++    </ol>
++
++    <h3>Method 2: Voicemeeter (Third-Party)</h3>
++    <ol>
++      <li>Download and install <code>Voicemeeter</code> (free)</li>
++      <li>Set Voicemeeter as your default playback device</li>
++      <li>In Voicemeeter, assign multiple hardware outputs (A1, A2, etc.) to your Bluetooth speakers</li>
++      <li>Audio is now routed to all assigned outputs</li>
++    </ol>
++
++    <p>Once multi-output is configured, this mixer controls the volume balance between your speakers.</p>
++  </div>
++</details>
++
++<script>
++(function () {
++  "use strict";
++
++  // -----------------------------------------------------------------------
++  // State
++  // -----------------------------------------------------------------------
++  const canvas = document.getElementById("mixer");
++  const ctx = canvas.getContext("2d");
++  const CX = canvas.width / 2;
++  const CY = canvas.height / 2;
++  const RING_RADIUS = 190;
++  const NODE_RADIUS = 28;
++  const CP_RADIUS = 16;
++  const EPSILON = 400; // prevents div-by-zero in inverse-square weighting
++
++  const state = {
++    devices: [],           // [{id, name, volume, x, y, displayVol}]
++    cp: { x: CX, y: CY }, // control point
++    isDragging: false,
++    connected: false,
++    lastError: null,
++    lastSentVolumes: {},   // device_id -> last volume sent (for throttling)
++  };
++
++  const statusBar = document.getElementById("statusBar");
++
++  // -----------------------------------------------------------------------
++  // Device fetching
++  // -----------------------------------------------------------------------
++
++  async function fetchDevices() {
++    try {
++      const res = await fetch("/api/devices");
++      if (!res.ok) throw new Error(`HTTP ${res.status}`);
++      const devices = await res.json();
++
++      // Lay out devices evenly on the ring
++      const n = devices.length;
++      devices.forEach((d, i) => {
++        const angle = (i * 2 * Math.PI) / n - Math.PI / 2; // start at top
++        d.x = CX + RING_RADIUS * Math.cos(angle);
++        d.y = CY + RING_RADIUS * Math.sin(angle);
++        // Preserve smooth display volume from prior frame if device existed
++        const prev = state.devices.find(p => p.id === d.id);
++        d.displayVol = prev ? prev.displayVol : (d.volume ?? 0);
++      });
++
++      state.devices = devices;
++      state.connected = true;
++      state.lastError = null;
++      updateStatus();
++    } catch (err) {
++      state.connected = false;
++      state.lastError = "Connection lost — retrying...";
++      updateStatus();
++    }
++  }
++
++  function updateStatus() {
++    if (!state.connected) {
++      statusBar.textContent = state.lastError || "Disconnected";
++      statusBar.className = "status-bar error";
++    } else {
++      const n = state.devices.length;
++      statusBar.textContent = n > 0
++        ? `${n} device${n !== 1 ? "s" : ""} connected`
++        : "No speakers detected";
++      statusBar.className = "status-bar";
++    }
++  }
++
++  // -----------------------------------------------------------------------
++  // Volume calculation & sending
++  // -----------------------------------------------------------------------
++
++  function computeVolumes() {
++    if (state.devices.length === 0) return;
++
++    const weights = state.devices.map(d => {
++      const dx = state.cp.x - d.x;
++      const dy = state.cp.y - d.y;
++      const distSq = dx * dx + dy * dy;
++      return 1 / (distSq + EPSILON);
++    });
++
++    const maxW = Math.max(...weights);
++
++    state.devices.forEach((d, i) => {
++      const normalized = maxW > 0 ? weights[i] / maxW : 0;
++      d.targetVol = normalized < 0.02 ? 0 : normalized;
++    });
++  }
++
++  async function sendVolumes() {
++    const toSend = [];
++    for (const d of state.devices) {
++      const target = d.targetVol ?? d.volume ?? 0;
++      const lastSent = state.lastSentVolumes[d.id];
++      // Only send if changed by more than 1%
++      if (lastSent === undefined || Math.abs(target - lastSent) > 0.01) {
++        toSend.push({ device_id: d.id, volume: Math.round(target * 1000) / 1000 });
++        state.lastSentVolumes[d.id] = target;
++      }
++    }
++
++    if (toSend.length === 0) return;
++
++    try {
++      await fetch("/api/volume/batch", {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ volumes: toSend }),
++      });
++    } catch {
++      // Volume send failure is non-critical — next frame will retry
++    }
++  }
++
++  // -----------------------------------------------------------------------
++  // Drawing
++  // -----------------------------------------------------------------------
++
++  function lerp(a, b, t) { return a + (b - a) * t; }
++
++  function draw() {
++    ctx.clearRect(0, 0, canvas.width, canvas.height);
++
++    // Background ring
++    ctx.beginPath();
++    ctx.arc(CX, CY, RING_RADIUS + 30, 0, Math.PI * 2);
++    ctx.strokeStyle = "rgba(255,255,255,0.04)";
++    ctx.lineWidth = 1;
++    ctx.stroke();
++
++    ctx.beginPath();
++    ctx.arc(CX, CY, RING_RADIUS, 0, Math.PI * 2);
++    ctx.strokeStyle = "rgba(255,255,255,0.08)";
++    ctx.lineWidth = 1;
++    ctx.stroke();
++
++    if (state.devices.length === 0) {
++      ctx.fillStyle = "#555";
++      ctx.font = "16px sans-serif";
++      ctx.textAlign = "center";
++      ctx.textBaseline = "middle";
++      ctx.fillText("No speakers detected", CX, CY);
++      requestAnimationFrame(draw);
++      return;
++    }
++
++    // Connection lines from control point to each device
++    for (const d of state.devices) {
++      const vol = d.displayVol ?? 0;
++      if (vol < 0.01) continue;
++
++      ctx.beginPath();
++      ctx.moveTo(state.cp.x, state.cp.y);
++      ctx.lineTo(d.x, d.y);
++      ctx.strokeStyle = `rgba(0, 212, 255, ${vol * 0.35})`;
++      ctx.lineWidth = 1 + vol * 2;
++      ctx.stroke();
++    }
++
++    // Device nodes
++    for (const d of state.devices) {
++      const target = d.targetVol ?? d.volume ?? 0;
++      d.displayVol = lerp(d.displayVol ?? 0, target, 0.15);
++      const vol = d.displayVol;
++
++      // Glow
++      if (vol > 0.01) {
++        const grad = ctx.createRadialGradient(d.x, d.y, NODE_RADIUS * 0.5, d.x, d.y, NODE_RADIUS * 2 + vol * 20);
++        grad.addColorStop(0, `rgba(0, 212, 255, ${vol * 0.4})`);
++        grad.addColorStop(1, "rgba(0, 212, 255, 0)");
++        ctx.beginPath();
++        ctx.arc(d.x, d.y, NODE_RADIUS * 2 + vol * 20, 0, Math.PI * 2);
++        ctx.fillStyle = grad;
++        ctx.fill();
++      }
++
++      // Node circle
++      ctx.beginPath();
++      ctx.arc(d.x, d.y, NODE_RADIUS, 0, Math.PI * 2);
++      const brightness = 30 + vol * 40;
++      ctx.fillStyle = `hsl(195, 80%, ${brightness}%)`;
++      ctx.fill();
++      ctx.strokeStyle = vol > 0.01 ? `rgba(0, 212, 255, ${0.4 + vol * 0.6})` : "rgba(255,255,255,0.15)";
++      ctx.lineWidth = 2;
++      ctx.stroke();
++
++      // Volume percentage inside node
++      ctx.fillStyle = "#fff";
++      ctx.font = "bold 13px sans-serif";
++      ctx.textAlign = "center";
++      ctx.textBaseline = "middle";
++      ctx.fillText(`${Math.round(vol * 100)}%`, d.x, d.y);
++
++      // Device name below node
++      ctx.fillStyle = "#aaa";
++      ctx.font = "11px sans-serif";
++      ctx.textAlign = "center";
++      const name = d.name.length > 20 ? d.name.slice(0, 18) + "..." : d.name;
++      ctx.fillText(name, d.x, d.y + NODE_RADIUS + 14);
++    }
++
++    // Control point
++    const cpGrad = ctx.createRadialGradient(state.cp.x, state.cp.y, 2, state.cp.x, state.cp.y, CP_RADIUS);
++    cpGrad.addColorStop(0, "#ffffff");
++    cpGrad.addColorStop(1, "rgba(255, 140, 50, 0.9)");
++    ctx.beginPath();
++    ctx.arc(state.cp.x, state.cp.y, CP_RADIUS, 0, Math.PI * 2);
++    ctx.fillStyle = cpGrad;
++    ctx.fill();
++    ctx.strokeStyle = "#ff8c32";
++    ctx.lineWidth = 2.5;
++    ctx.stroke();
++
++    // Small crosshair inside control point
++    ctx.strokeStyle = "rgba(0,0,0,0.3)";
++    ctx.lineWidth = 1;
++    ctx.beginPath();
++    ctx.moveTo(state.cp.x - 5, state.cp.y);
++    ctx.lineTo(state.cp.x + 5, state.cp.y);
++    ctx.moveTo(state.cp.x, state.cp.y - 5);
++    ctx.lineTo(state.cp.x, state.cp.y + 5);
++    ctx.stroke();
++
++    requestAnimationFrame(draw);
++  }
++
++  // -----------------------------------------------------------------------
++  // Interaction
++  // -----------------------------------------------------------------------
++
++  function getPointerPos(e) {
++    const rect = canvas.getBoundingClientRect();
++    const scaleX = canvas.width / rect.width;
++    const scaleY = canvas.height / rect.height;
++    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
++    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
++    return {
++      x: (clientX - rect.left) * scaleX,
++      y: (clientY - rect.top) * scaleY,
++    };
++  }
++
++  function isNearCP(pos) {
++    const dx = pos.x - state.cp.x;
++    const dy = pos.y - state.cp.y;
++    return dx * dx + dy * dy <= (CP_RADIUS + 10) * (CP_RADIUS + 10);
++  }
++
++  function clampToRing(x, y) {
++    const dx = x - CX;
++    const dy = y - CY;
++    const dist = Math.sqrt(dx * dx + dy * dy);
++    const maxDist = RING_RADIUS - 5;
++    if (dist > maxDist) {
++      return { x: CX + (dx / dist) * maxDist, y: CY + (dy / dist) * maxDist };
++    }
++    return { x, y };
++  }
++
++  canvas.addEventListener("mousedown", (e) => {
++    const pos = getPointerPos(e);
++    if (isNearCP(pos)) {
++      state.isDragging = true;
++      canvas.style.cursor = "grabbing";
++    }
++  });
++
++  canvas.addEventListener("mousemove", (e) => {
++    const pos = getPointerPos(e);
++    if (state.isDragging) {
++      const clamped = clampToRing(pos.x, pos.y);
++      state.cp.x = clamped.x;
++      state.cp.y = clamped.y;
++      computeVolumes();
++    } else {
++      canvas.style.cursor = isNearCP(pos) ? "grab" : "default";
++    }
++  });
++
++  canvas.addEventListener("mouseup", () => {
++    state.isDragging = false;
++    canvas.style.cursor = "default";
++  });
++
++  canvas.addEventListener("mouseleave", () => {
++    state.isDragging = false;
++    canvas.style.cursor = "default";
++  });
++
++  // Touch support
++  canvas.addEventListener("touchstart", (e) => {
++    const pos = getPointerPos(e);
++    if (isNearCP(pos)) {
++      state.isDragging = true;
++      e.preventDefault();
++    }
++  }, { passive: false });
++
++  canvas.addEventListener("touchmove", (e) => {
++    if (state.isDragging) {
++      e.preventDefault();
++      const pos = getPointerPos(e);
++      const clamped = clampToRing(pos.x, pos.y);
++      state.cp.x = clamped.x;
++      state.cp.y = clamped.y;
++      computeVolumes();
++    }
++  }, { passive: false });
++
++  canvas.addEventListener("touchend", () => { state.isDragging = false; });
++
++  // -----------------------------------------------------------------------
++  // Refresh button
++  // -----------------------------------------------------------------------
++
++  document.getElementById("btnRefresh").addEventListener("click", async () => {
++    try {
++      const res = await fetch("/api/refresh", { method: "POST" });
++      if (res.ok) await fetchDevices();
++    } catch { /* ignore */ }
++  });
++
++  // -----------------------------------------------------------------------
++  // Main loop
++  // -----------------------------------------------------------------------
++
++  // Send volume updates at ~30fps while dragging
++  let volumeInterval = setInterval(() => {
++    if (state.isDragging) sendVolumes();
++  }, 33);
++
++  // Also send final volumes when drag ends
++  canvas.addEventListener("mouseup", () => sendVolumes());
++  canvas.addEventListener("touchend", () => sendVolumes());
++
++  // Poll devices every 5 seconds
++  fetchDevices();
++  setInterval(fetchDevices, 5000);
++
++  // Start render loop
++  requestAnimationFrame(draw);
++})();
++</script>
++</body>
++</html>
+diff --git a/test b/test
+deleted file mode 100644
+index 850bfb7..0000000
+--- a/test
++++ /dev/null
+@@ -1,8 +0,0 @@
+-#!/usr/bin/env python3
+-# hello.py - prints "hello world"
+-
+-def main():
+-    print("hello world")
+-
+-if __name__ == "__main__":
+-    main()
+\ No newline at end of file
+diff --git a/test_server.py b/test_server.py
+new file mode 100644
+index 0000000..0327e22
+--- /dev/null
++++ b/test_server.py
+@@ -0,0 +1,189 @@
++"""
++Unit tests for the Bluetooth Crossfade Mixer backend.
++
++Mocks pycaw/comtypes so tests run on any platform (not just Windows).
++"""
++
++import json
++import unittest
++from unittest.mock import patch, MagicMock
++
++# Mock comtypes and pycaw before importing server
++import sys
++
++mock_comtypes = MagicMock()
++mock_pycaw = MagicMock()
++mock_pycaw_constants = MagicMock()
++mock_pycaw_constants.EDataFlow.eRender.value = 0
++mock_pycaw_constants.DEVICE_STATE.ACTIVE.value = 1
++
++sys.modules["comtypes"] = mock_comtypes
++sys.modules["pycaw"] = MagicMock()
++sys.modules["pycaw.pycaw"] = mock_pycaw
++sys.modules["pycaw.constants"] = mock_pycaw_constants
++
++import server
++
++
++def _make_mock_device(device_id, name, volume=0.5):
++    """Create a mock audio device."""
++    dev = MagicMock()
++    dev.id = device_id
++    dev.FriendlyName = name
++    endpoint = MagicMock()
++    endpoint.GetMasterVolumeLevelScalar.return_value = volume
++    dev.EndpointVolume = endpoint
++    return dev
++
++
++class TestAPIRoutes(unittest.TestCase):
++    def setUp(self):
++        server.app.testing = True
++        self.client = server.app.test_client()
++
++    @patch.object(server, "get_playback_devices")
++    def test_get_devices(self, mock_get):
++        mock_get.return_value = [
++            {"id": "dev1", "name": "Speaker A", "volume": 0.75},
++        ]
++        resp = self.client.get("/api/devices")
++        self.assertEqual(resp.status_code, 200)
++        data = json.loads(resp.data)
++        self.assertEqual(len(data), 1)
++        self.assertEqual(data[0]["name"], "Speaker A")
++
++    @patch.object(server, "set_device_volume")
++    def test_set_volume_success(self, mock_set):
++        mock_set.return_value = True
++        resp = self.client.post(
++            "/api/volume",
++            data=json.dumps({"device_id": "dev1", "volume": 0.5}),
++            content_type="application/json",
++        )
++        self.assertEqual(resp.status_code, 200)
++        data = json.loads(resp.data)
++        self.assertTrue(data["success"])
++
++    def test_set_volume_missing_body(self):
++        resp = self.client.post("/api/volume", content_type="application/json")
++        self.assertEqual(resp.status_code, 400)
++
++    def test_set_volume_missing_device_id(self):
++        resp = self.client.post(
++            "/api/volume",
++            data=json.dumps({"volume": 0.5}),
++            content_type="application/json",
++        )
++        self.assertEqual(resp.status_code, 400)
++
++    def test_set_volume_missing_volume(self):
++        resp = self.client.post(
++            "/api/volume",
++            data=json.dumps({"device_id": "dev1"}),
++            content_type="application/json",
++        )
++        self.assertEqual(resp.status_code, 400)
++
++    def test_set_volume_invalid_volume(self):
++        resp = self.client.post(
++            "/api/volume",
++            data=json.dumps({"device_id": "dev1", "volume": "not_a_number"}),
++            content_type="application/json",
++        )
++        self.assertEqual(resp.status_code, 400)
++
++    def test_set_volume_invalid_device_id_type(self):
++        resp = self.client.post(
++            "/api/volume",
++            data=json.dumps({"device_id": 12345, "volume": 0.5}),
++            content_type="application/json",
++        )
++        self.assertEqual(resp.status_code, 400)
++
++    def test_set_volume_device_id_too_long(self):
++        resp = self.client.post(
++            "/api/volume",
++            data=json.dumps({"device_id": "x" * 600, "volume": 0.5}),
++            content_type="application/json",
++        )
++        self.assertEqual(resp.status_code, 400)
++
++    @patch.object(server, "set_volumes_batch")
++    def test_batch_volume(self, mock_batch):
++        mock_batch.return_value = {"dev1": True, "dev2": True}
++        resp = self.client.post(
++            "/api/volume/batch",
++            data=json.dumps({"volumes": [
++                {"device_id": "dev1", "volume": 0.8},
++                {"device_id": "dev2", "volume": 0.3},
++            ]}),
++            content_type="application/json",
++        )
++        self.assertEqual(resp.status_code, 200)
++        data = json.loads(resp.data)
++        self.assertTrue(data["success"])
++
++    def test_batch_volume_missing_body(self):
++        resp = self.client.post("/api/volume/batch", content_type="application/json")
++        self.assertEqual(resp.status_code, 400)
++
++    @patch.object(server, "get_playback_devices")
++    def test_refresh(self, mock_get):
++        mock_get.return_value = []
++        resp = self.client.post("/api/refresh")
++        self.assertEqual(resp.status_code, 200)
++
++    def test_index_page(self):
++        resp = self.client.get("/")
++        self.assertEqual(resp.status_code, 200)
++        self.assertIn(b"Bluetooth Crossfade Mixer", resp.data)
++
++
++class TestSetDeviceVolume(unittest.TestCase):
++    @patch.object(server, "_get_active_render_devices")
++    def test_clamps_volume(self, mock_enum):
++        dev = _make_mock_device("dev1", "Speaker", 0.5)
++        mock_enum.return_value = [dev]
++        server.set_device_volume("dev1", 1.5)
++        dev.EndpointVolume.SetMasterVolumeLevelScalar.assert_called_with(1.0, None)
++
++    @patch.object(server, "_get_active_render_devices")
++    def test_clamps_volume_negative(self, mock_enum):
++        dev = _make_mock_device("dev1", "Speaker", 0.5)
++        mock_enum.return_value = [dev]
++        server.set_device_volume("dev1", -0.5)
++        dev.EndpointVolume.SetMasterVolumeLevelScalar.assert_called_with(0.0, None)
++
++    @patch.object(server, "_get_active_render_devices")
++    def test_device_not_found(self, mock_enum):
++        mock_enum.return_value = []
++        result = server.set_device_volume("nonexistent", 0.5)
++        self.assertFalse(result)
++
++
++class TestSetVolumesBatch(unittest.TestCase):
++    @patch.object(server, "_get_active_render_devices")
++    def test_batch_sets_multiple(self, mock_enum):
++        dev1 = _make_mock_device("dev1", "A")
++        dev2 = _make_mock_device("dev2", "B")
++        mock_enum.return_value = [dev1, dev2]
++
++        results = server.set_volumes_batch([
++            {"device_id": "dev1", "volume": 0.8},
++            {"device_id": "dev2", "volume": 0.3},
++        ])
++
++        self.assertTrue(results["dev1"])
++        self.assertTrue(results["dev2"])
++        dev1.EndpointVolume.SetMasterVolumeLevelScalar.assert_called_with(0.8, None)
++        dev2.EndpointVolume.SetMasterVolumeLevelScalar.assert_called_with(0.3, None)
++
++    @patch.object(server, "_get_active_render_devices")
++    def test_batch_missing_device(self, mock_enum):
++        mock_enum.return_value = []
++        results = server.set_volumes_batch([{"device_id": "dev1", "volume": 0.5}])
++        self.assertFalse(results["dev1"])
++
++
++if __name__ == "__main__":
++    unittest.main()
+-- 
+2.43.0
+
+
+From 7175f8be6d73d87db5603ac0fbab5446a0bb38f7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Mar 2026 23:01:03 +0000
+Subject: [PATCH 2/6] feat: implement all 8 feature enhancements
+
+1. Crossfade curve presets: linear, logarithmic, equal-power, and
+   inverse-square curves selectable from toolbar dropdown
+2. Per-device mute toggle: click speaker nodes or press M to mute/unmute
+   nearest speaker; muted devices show "MUTE" and are excluded from mix
+3. Preset positions: save/load control point positions with curve type
+   to localStorage; recall by clicking or pressing 1-9 keys
+4. Device grouping: create named zones that link speakers to share the
+   same volume (max of group members); visual arcs connect grouped nodes
+5. WebSocket real-time sync: flask-socketio replaces HTTP polling for
+   lower-latency volume updates and push-based device change notifications;
+   background monitor thread detects device changes every 3s
+6. Per-device EQ: bass/treble sliders (-1.0 to +1.0) stored server-side
+   and synced via WebSocket; designed for integration with Equalizer APO
+7. Auto-reconnect volume restore: server remembers last volume per device
+   and automatically restores it when a Bluetooth speaker reconnects
+8. Keyboard/accessibility: arrow keys move control point (shift for fine),
+   Home centers it, Tab cycles device focus with screen reader announcements,
+   M toggles mute, 1-9 loads presets; ARIA live region and roles added
+
+Backend: 40 tests covering all new API endpoints and logic.
+
+https://claude.ai/code/session_01S7VjSQ7Bf5X2V5UZjp8yoZ
+---
+ requirements.txt     |    1 +
+ server.py            |  359 +++++++++++++--
+ templates/index.html | 1045 +++++++++++++++++++++++++++++++++++-------
+ test_server.py       |  236 +++++++++-
+ 4 files changed, 1447 insertions(+), 194 deletions(-)
+
+diff --git a/requirements.txt b/requirements.txt
+index c532e5f..1a67e2a 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,3 +1,4 @@
+ flask>=3.0
++flask-socketio>=5.3
+ pycaw>=20240210
+ comtypes>=1.4
+diff --git a/server.py b/server.py
+index f43e445..f10bd7b 100644
+--- a/server.py
++++ b/server.py
+@@ -1,12 +1,16 @@
+ """
+ Bluetooth Speaker Crossfade Mixer — Backend
+ Flask API + pycaw device enumeration for per-device volume control.
++Features: crossfade curves, mute, presets, groups, WebSocket, EQ, auto-reconnect.
+ """
+ 
+ import logging
+ import webbrowser
+ import threading
++import json
++import os
+ from flask import Flask, render_template, jsonify, request
++from flask_socketio import SocketIO, emit
+ 
+ # pycaw / COM imports for Windows Core Audio
+ import comtypes
+@@ -25,16 +29,46 @@ log = logging.getLogger(__name__)
+ # ---------------------------------------------------------------------------
+ 
+ app = Flask(__name__, template_folder="templates")
++app.config["SECRET_KEY"] = os.urandom(24)
++socketio = SocketIO(app, cors_allowed_origins=None, async_mode="threading")
+ 
+ # Thread-local storage for COM initialization tracking
+ _com_initialized = threading.local()
+ 
+ # ---------------------------------------------------------------------------
+-# Device enumeration helpers
++# Persistent state (in-memory, survives across requests)
+ # ---------------------------------------------------------------------------
+ 
+ # Maximum length for device_id strings to prevent abuse
+ _MAX_DEVICE_ID_LEN = 512
++_MAX_GROUP_NAME_LEN = 64
++_MAX_PRESET_NAME_LEN = 64
++_MAX_PRESETS = 20
++_MAX_GROUPS = 20
++
++# Muted devices: set of device_id
++_muted_devices = set()
++_muted_lock = threading.Lock()
++
++# Device groups: {group_name: [device_id, ...]}
++_device_groups = {}
++_groups_lock = threading.Lock()
++
++# Last known volumes: {device_id: float} — for auto-reconnect restore
++_last_volumes = {}
++_volumes_lock = threading.Lock()
++
++# Per-device EQ settings: {device_id: {"bass": float, "treble": float}}
++_device_eq = {}
++_eq_lock = threading.Lock()
++
++# Previous device set for detecting reconnections
++_previous_device_ids = set()
++_prev_lock = threading.Lock()
++
++# ---------------------------------------------------------------------------
++# Device enumeration helpers
++# ---------------------------------------------------------------------------
+ 
+ 
+ def _init_com():
+@@ -59,7 +93,8 @@ def _get_active_render_devices():
+ def get_playback_devices():
+     """
+     Enumerate all active audio *render* (playback) devices and return a list
+-    of dicts with id, name, and current volume.
++    of dicts with id, name, current volume, mute state, group, and EQ.
++    Also handles auto-reconnect volume restoration.
+     """
+     devices_info = []
+ 
+@@ -69,6 +104,8 @@ def get_playback_devices():
+         log.error("Failed to list devices: %s", exc)
+         return devices_info
+ 
++    current_ids = set()
++
+     for device in all_devices:
+         try:
+             friendly_name = device.FriendlyName
+@@ -76,6 +113,8 @@ def get_playback_devices():
+             if not friendly_name or not device_id:
+                 continue
+ 
++            current_ids.add(device_id)
++
+             volume_level = None
+             try:
+                 endpoint_volume = device.EndpointVolume
+@@ -84,23 +123,79 @@ def get_playback_devices():
+             except Exception:
+                 pass
+ 
++            with _muted_lock:
++                is_muted = device_id in _muted_devices
++
++            with _eq_lock:
++                eq = _device_eq.get(device_id, {"bass": 0.0, "treble": 0.0})
++
++            # Find which group this device belongs to
++            group_name = None
++            with _groups_lock:
++                for gname, members in _device_groups.items():
++                    if device_id in members:
++                        group_name = gname
++                        break
++
+             devices_info.append({
+                 "id": device_id,
+                 "name": friendly_name,
+                 "volume": round(volume_level, 4) if volume_level is not None else None,
++                "muted": is_muted,
++                "group": group_name,
++                "eq": eq,
+             })
+ 
+         except Exception as exc:
+             log.warning("Skipping device: %s", exc)
+             continue
+ 
++    # Auto-reconnect: detect newly appeared devices and restore their volume
++    _handle_reconnections(current_ids, all_devices)
++
+     return devices_info
+ 
+ 
++def _handle_reconnections(current_ids, all_devices):
++    """Restore volume for devices that just reconnected."""
++    with _prev_lock:
++        previously_known = _previous_device_ids.copy()
++        _previous_device_ids.clear()
++        _previous_device_ids.update(current_ids)
++
++    newly_connected = current_ids - previously_known
++    if not newly_connected:
++        return
++
++    with _volumes_lock:
++        restore_map = {
++            did: _last_volumes[did]
++            for did in newly_connected
++            if did in _last_volumes
++        }
++
++    if not restore_map:
++        return
++
++    for device in all_devices:
++        try:
++            if device.id in restore_map:
++                endpoint_volume = device.EndpointVolume
++                if endpoint_volume is not None:
++                    vol = restore_map[device.id]
++                    endpoint_volume.SetMasterVolumeLevelScalar(vol, None)
++                    log.info("Auto-restored volume %.2f on reconnected device %s", vol, device.id)
++                    socketio.emit("device_reconnected", {
++                        "device_id": device.id,
++                        "restored_volume": vol,
++                    })
++        except Exception as exc:
++            log.error("Failed to restore volume on %s: %s", device.id, exc)
++
++
+ def set_device_volume(device_id, volume):
+     """
+     Set the master volume on the device identified by *device_id*.
+-
+     Returns True on success, False on failure.
+     """
+     volume = max(0.0, min(1.0, float(volume)))
+@@ -119,6 +214,9 @@ def set_device_volume(device_id, volume):
+                     log.warning("Device has no volume interface: %s", device_id)
+                     return False
+                 endpoint_volume.SetMasterVolumeLevelScalar(volume, None)
++                # Remember volume for auto-reconnect
++                with _volumes_lock:
++                    _last_volumes[device_id] = volume
+                 return True
+         except Exception as exc:
+             log.error("Error setting volume on %s: %s", device_id, exc)
+@@ -131,12 +229,6 @@ def set_device_volume(device_id, volume):
+ def set_volumes_batch(volumes):
+     """
+     Set volume on multiple devices in a single enumeration pass.
+-
+-    Parameters
+-    ----------
+-    volumes : list[dict]
+-        Each dict must have ``device_id`` (str) and ``volume`` (float 0-1).
+-
+     Returns a dict mapping device_id -> bool (success/failure).
+     """
+     results = {}
+@@ -165,11 +257,13 @@ def set_volumes_batch(volumes):
+                 else:
+                     endpoint_volume.SetMasterVolumeLevelScalar(lookup[device.id], None)
+                     results[device.id] = True
++                    # Remember volume for auto-reconnect
++                    with _volumes_lock:
++                        _last_volumes[device.id] = lookup[device.id]
+         except Exception as exc:
+             log.error("Error setting volume on %s: %s", device.id, exc)
+             results[device.id] = False
+ 
+-    # Mark devices that were requested but not found
+     for did in lookup:
+         if did not in results:
+             results[did] = False
+@@ -177,6 +271,11 @@ def set_volumes_batch(volumes):
+     return results
+ 
+ 
++def _validate_device_id(device_id):
++    """Return True if device_id is a valid string within length limits."""
++    return isinstance(device_id, str) and 0 < len(device_id) <= _MAX_DEVICE_ID_LEN
++
++
+ # ---------------------------------------------------------------------------
+ # Flask routes
+ # ---------------------------------------------------------------------------
+@@ -196,11 +295,7 @@ def api_devices():
+ 
+ @app.route("/api/volume", methods=["POST"])
+ def api_volume():
+-    """
+-    Set volume on a specific device.
+-
+-    Expects JSON body: {"device_id": "...", "volume": 0.0-1.0}
+-    """
++    """Set volume on a specific device."""
+     data = request.get_json(silent=True)
+     if not data:
+         return jsonify({"success": False, "error": "Invalid or missing JSON body"}), 400
+@@ -208,7 +303,7 @@ def api_volume():
+     device_id = data.get("device_id")
+     volume = data.get("volume")
+ 
+-    if not isinstance(device_id, str) or len(device_id) > _MAX_DEVICE_ID_LEN:
++    if not _validate_device_id(device_id):
+         return jsonify({"success": False, "error": "Invalid 'device_id'"}), 400
+     if volume is None:
+         return jsonify({"success": False, "error": "Missing 'volume'"}), 400
+@@ -226,11 +321,7 @@ def api_volume():
+ 
+ @app.route("/api/volume/batch", methods=["POST"])
+ def api_volume_batch():
+-    """
+-    Set volume on multiple devices in one call.
+-
+-    Expects JSON body: {"volumes": [{"device_id": "...", "volume": 0.0-1.0}, ...]}
+-    """
++    """Set volume on multiple devices in one call."""
+     data = request.get_json(silent=True)
+     if not data or "volumes" not in data:
+         return jsonify({"success": False, "error": "Expected JSON with 'volumes' array"}), 400
+@@ -239,12 +330,11 @@ def api_volume_batch():
+     if not isinstance(volumes, list) or len(volumes) > 20:
+         return jsonify({"success": False, "error": "'volumes' must be an array (max 20)"}), 400
+ 
+-    # Validate entries
+     for entry in volumes:
+         did = entry.get("device_id")
+         vol = entry.get("volume")
+-        if not isinstance(did, str) or len(did) > _MAX_DEVICE_ID_LEN:
+-            return jsonify({"success": False, "error": f"Invalid device_id in batch"}), 400
++        if not _validate_device_id(did):
++            return jsonify({"success": False, "error": "Invalid device_id in batch"}), 400
+         if vol is None:
+             return jsonify({"success": False, "error": "Missing 'volume' in batch entry"}), 400
+         try:
+@@ -260,7 +350,221 @@ def api_volume_batch():
+ @app.route("/api/refresh", methods=["POST"])
+ def api_refresh():
+     """Re-scan devices and return the updated list."""
+-    return jsonify(get_playback_devices())
++    devices = get_playback_devices()
++    socketio.emit("devices_updated", devices)
++    return jsonify(devices)
++
++
++# ---------------------------------------------------------------------------
++# Mute API
++# ---------------------------------------------------------------------------
++
++
++@app.route("/api/mute", methods=["POST"])
++def api_mute():
++    """
++    Toggle mute on a device.
++    Expects JSON: {"device_id": "...", "muted": true/false}
++    When muted, the device volume is set to 0 on the system.
++    """
++    data = request.get_json(silent=True)
++    if not data:
++        return jsonify({"success": False, "error": "Invalid JSON"}), 400
++
++    device_id = data.get("device_id")
++    muted = data.get("muted")
++
++    if not _validate_device_id(device_id):
++        return jsonify({"success": False, "error": "Invalid 'device_id'"}), 400
++    if not isinstance(muted, bool):
++        return jsonify({"success": False, "error": "'muted' must be boolean"}), 400
++
++    with _muted_lock:
++        if muted:
++            _muted_devices.add(device_id)
++        else:
++            _muted_devices.discard(device_id)
++
++    # Set system volume to 0 when muting
++    if muted:
++        set_device_volume(device_id, 0.0)
++
++    socketio.emit("mute_changed", {"device_id": device_id, "muted": muted})
++    return jsonify({"success": True, "device_id": device_id, "muted": muted})
++
++
++# ---------------------------------------------------------------------------
++# Device Groups API
++# ---------------------------------------------------------------------------
++
++
++@app.route("/api/groups", methods=["GET"])
++def api_groups_list():
++    """Return all device groups."""
++    with _groups_lock:
++        return jsonify(_device_groups)
++
++
++@app.route("/api/groups", methods=["POST"])
++def api_groups_create():
++    """
++    Create or update a device group.
++    Expects JSON: {"name": "...", "device_ids": ["...", ...]}
++    """
++    data = request.get_json(silent=True)
++    if not data:
++        return jsonify({"success": False, "error": "Invalid JSON"}), 400
++
++    name = data.get("name")
++    device_ids = data.get("device_ids")
++
++    if not isinstance(name, str) or not name.strip() or len(name) > _MAX_GROUP_NAME_LEN:
++        return jsonify({"success": False, "error": "Invalid group name"}), 400
++
++    if not isinstance(device_ids, list):
++        return jsonify({"success": False, "error": "'device_ids' must be an array"}), 400
++
++    for did in device_ids:
++        if not _validate_device_id(did):
++            return jsonify({"success": False, "error": f"Invalid device_id in group"}), 400
++
++    name = name.strip()
++
++    with _groups_lock:
++        if name not in _device_groups and len(_device_groups) >= _MAX_GROUPS:
++            return jsonify({"success": False, "error": "Maximum group limit reached"}), 400
++        # Remove these devices from any other groups
++        for gname in list(_device_groups.keys()):
++            _device_groups[gname] = [d for d in _device_groups[gname] if d not in device_ids]
++            if not _device_groups[gname]:
++                del _device_groups[gname]
++        if device_ids:
++            _device_groups[name] = device_ids
++
++    socketio.emit("groups_updated", _device_groups)
++    return jsonify({"success": True, "groups": _device_groups})
++
++
++@app.route("/api/groups/<name>", methods=["DELETE"])
++def api_groups_delete(name):
++    """Delete a device group."""
++    with _groups_lock:
++        if name in _device_groups:
++            del _device_groups[name]
++    socketio.emit("groups_updated", _device_groups)
++    return jsonify({"success": True})
++
++
++# ---------------------------------------------------------------------------
++# EQ API (per-device bass/treble settings)
++# ---------------------------------------------------------------------------
++
++
++@app.route("/api/eq", methods=["POST"])
++def api_eq():
++    """
++    Set EQ (bass/treble) for a device.
++    Expects JSON: {"device_id": "...", "bass": -1.0 to 1.0, "treble": -1.0 to 1.0}
++
++    Note: These settings are stored and returned with device info. Actual audio
++    EQ processing requires additional audio middleware (e.g., Voicemeeter or
++    Equalizer APO) — this API provides the control surface for such integration.
++    """
++    data = request.get_json(silent=True)
++    if not data:
++        return jsonify({"success": False, "error": "Invalid JSON"}), 400
++
++    device_id = data.get("device_id")
++    bass = data.get("bass")
++    treble = data.get("treble")
++
++    if not _validate_device_id(device_id):
++        return jsonify({"success": False, "error": "Invalid 'device_id'"}), 400
++
++    try:
++        bass = max(-1.0, min(1.0, float(bass))) if bass is not None else 0.0
++        treble = max(-1.0, min(1.0, float(treble))) if treble is not None else 0.0
++    except (TypeError, ValueError):
++        return jsonify({"success": False, "error": "bass/treble must be numbers"}), 400
++
++    with _eq_lock:
++        _device_eq[device_id] = {"bass": round(bass, 2), "treble": round(treble, 2)}
++        eq = _device_eq[device_id]
++
++    socketio.emit("eq_changed", {"device_id": device_id, "eq": eq})
++    return jsonify({"success": True, "device_id": device_id, "eq": eq})
++
++
++@app.route("/api/eq/<device_id>", methods=["GET"])
++def api_eq_get(device_id):
++    """Get EQ settings for a device."""
++    with _eq_lock:
++        eq = _device_eq.get(device_id, {"bass": 0.0, "treble": 0.0})
++    return jsonify(eq)
++
++
++# ---------------------------------------------------------------------------
++# WebSocket events
++# ---------------------------------------------------------------------------
++
++
++@socketio.on("connect")
++def ws_connect():
++    """Client connected — send current state."""
++    devices = get_playback_devices()
++    emit("devices_updated", devices)
++    with _groups_lock:
++        emit("groups_updated", dict(_device_groups))
++
++
++@socketio.on("request_refresh")
++def ws_request_refresh():
++    """Client requested a device refresh via WebSocket."""
++    devices = get_playback_devices()
++    emit("devices_updated", devices, broadcast=True)
++
++
++@socketio.on("set_volume")
++def ws_set_volume(data):
++    """Set volume on a device via WebSocket."""
++    device_id = data.get("device_id")
++    volume = data.get("volume")
++    if _validate_device_id(device_id) and volume is not None:
++        try:
++            volume = float(volume)
++            set_device_volume(device_id, volume)
++        except (TypeError, ValueError):
++            pass
++
++
++@socketio.on("set_volumes_batch")
++def ws_set_volumes_batch(data):
++    """Set batch volumes via WebSocket (lower latency than HTTP)."""
++    volumes = data.get("volumes", [])
++    if isinstance(volumes, list) and len(volumes) <= 20:
++        set_volumes_batch(volumes)
++
++
++# ---------------------------------------------------------------------------
++# Background device monitor (pushes changes via WebSocket)
++# ---------------------------------------------------------------------------
++
++_monitor_interval = 3.0  # seconds
++
++
++def _device_monitor():
++    """Periodically check for device changes and push updates via WebSocket."""
++    prev_snapshot = None
++    while True:
++        try:
++            devices = get_playback_devices()
++            snapshot = json.dumps(devices, sort_keys=True)
++            if snapshot != prev_snapshot:
++                prev_snapshot = snapshot
++                socketio.emit("devices_updated", devices)
++        except Exception as exc:
++            log.error("Device monitor error: %s", exc)
++        socketio.sleep(_monitor_interval)
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -274,7 +578,10 @@ if __name__ == "__main__":
+ 
+     log.info("Starting Bluetooth Crossfade Mixer server at %s", url)
+ 
++    # Start background device monitor
++    socketio.start_background_task(_device_monitor)
++
+     # Open the browser after a short delay so the server is ready.
+     threading.Timer(1.5, lambda: webbrowser.open(url)).start()
+ 
+-    app.run(host=HOST, port=PORT, debug=False)
++    socketio.run(app, host=HOST, port=PORT, debug=False, allow_unsafe_werkzeug=True)
+diff --git a/templates/index.html b/templates/index.html
+index a11520c..6164514 100644
+--- a/templates/index.html
++++ b/templates/index.html
+@@ -18,65 +18,77 @@
+     padding: 24px 16px;
+   }
+ 
+-  h1 {
+-    font-size: 1.6rem;
+-    font-weight: 600;
+-    margin-bottom: 6px;
+-    color: #ffffff;
+-  }
+-
+-  .subtitle {
+-    font-size: 0.85rem;
+-    color: #888;
+-    margin-bottom: 20px;
+-  }
++  h1 { font-size: 1.6rem; font-weight: 600; margin-bottom: 6px; color: #fff; }
++  .subtitle { font-size: 0.85rem; color: #888; margin-bottom: 16px; }
+ 
++  /* Mixer canvas */
+   canvas {
+     border-radius: 50%;
+     box-shadow: 0 0 40px rgba(0, 212, 255, 0.08);
+     cursor: default;
+     touch-action: none;
++    outline: none;
+   }
++  canvas:focus { box-shadow: 0 0 40px rgba(0, 212, 255, 0.2), 0 0 0 2px #00d4ff; }
+ 
+-  .controls {
+-    margin-top: 16px;
++  /* Controls toolbar */
++  .toolbar {
++    margin-top: 14px;
+     display: flex;
+-    gap: 10px;
++    gap: 8px;
+     align-items: center;
++    flex-wrap: wrap;
++    justify-content: center;
++    max-width: 560px;
+   }
+ 
+-  button {
++  button, select {
+     background: #16213e;
+     color: #e0e0e0;
+     border: 1px solid #0f3460;
+     border-radius: 6px;
+-    padding: 8px 18px;
+-    font-size: 0.85rem;
++    padding: 7px 14px;
++    font-size: 0.82rem;
+     cursor: pointer;
+     transition: background 0.2s, border-color 0.2s;
+   }
+-
+-  button:hover {
+-    background: #0f3460;
+-    border-color: #00d4ff;
+-  }
+-
++  button:hover, select:hover { background: #0f3460; border-color: #00d4ff; }
+   button:active { transform: scale(0.97); }
++  button.active { background: #0f3460; border-color: #00d4ff; color: #00d4ff; }
++  select { padding: 7px 8px; }
+ 
+   .status-bar {
+-    margin-top: 10px;
+-    font-size: 0.78rem;
++    margin-top: 8px;
++    font-size: 0.76rem;
+     color: #666;
+     text-align: center;
+     min-height: 1.2em;
+   }
+-
+   .status-bar.error { color: #ff6b6b; }
++  .status-bar .ws-indicator {
++    display: inline-block;
++    width: 7px; height: 7px;
++    border-radius: 50%;
++    margin-right: 4px;
++    vertical-align: middle;
++  }
++  .status-bar .ws-indicator.connected { background: #4caf50; }
++  .status-bar .ws-indicator.disconnected { background: #ff6b6b; }
++
++  /* Panels */
++  .panel-row {
++    margin-top: 16px;
++    display: flex;
++    gap: 12px;
++    flex-wrap: wrap;
++    justify-content: center;
++    max-width: 700px;
++    width: 100%;
++  }
+ 
+   details {
+-    margin-top: 24px;
++    flex: 1 1 320px;
+     max-width: 500px;
+-    width: 100%;
+     background: #16213e;
+     border: 1px solid #0f3460;
+     border-radius: 8px;
+@@ -84,84 +96,215 @@
+   }
+ 
+   summary {
+-    padding: 12px 16px;
++    padding: 10px 14px;
+     cursor: pointer;
+-    font-size: 0.9rem;
++    font-size: 0.85rem;
+     font-weight: 500;
+     color: #aaa;
+     user-select: none;
+   }
+-
+   summary:hover { color: #e0e0e0; }
+ 
+-  .guide-content {
+-    padding: 0 16px 16px;
+-    font-size: 0.82rem;
++  .panel-body {
++    padding: 0 14px 14px;
++    font-size: 0.8rem;
+     line-height: 1.6;
+     color: #999;
+   }
+ 
+-  .guide-content h3 {
+-    color: #ccc;
+-    font-size: 0.88rem;
+-    margin: 12px 0 6px;
++  .panel-body h3 { color: #ccc; font-size: 0.85rem; margin: 10px 0 4px; }
++  .panel-body ol, .panel-body ul { padding-left: 20px; }
++  .panel-body li { margin-bottom: 3px; }
++  .panel-body code { color: #00d4ff; font-size: 0.8rem; }
++
++  /* Preset list */
++  .preset-list { list-style: none; padding: 0; margin: 8px 0; }
++  .preset-list li {
++    display: flex;
++    align-items: center;
++    justify-content: space-between;
++    padding: 5px 8px;
++    margin: 3px 0;
++    background: #1a1a2e;
++    border-radius: 4px;
++    font-size: 0.8rem;
+   }
++  .preset-list li .preset-name { cursor: pointer; flex: 1; }
++  .preset-list li .preset-name:hover { color: #00d4ff; }
++  .preset-list li .preset-delete {
++    cursor: pointer;
++    color: #666;
++    margin-left: 8px;
++    font-size: 0.9rem;
++  }
++  .preset-list li .preset-delete:hover { color: #ff6b6b; }
+ 
+-  .guide-content ol, .guide-content ul {
+-    padding-left: 20px;
++  .preset-save-row {
++    display: flex; gap: 6px; margin-top: 6px;
++  }
++  .preset-save-row input {
++    flex: 1;
++    background: #1a1a2e;
++    color: #e0e0e0;
++    border: 1px solid #0f3460;
++    border-radius: 4px;
++    padding: 5px 8px;
++    font-size: 0.8rem;
++    outline: none;
++  }
++  .preset-save-row input:focus { border-color: #00d4ff; }
++
++  /* Group management */
++  .group-list { list-style: none; padding: 0; margin: 6px 0; }
++  .group-list li {
++    display: flex; align-items: center; justify-content: space-between;
++    padding: 5px 8px; margin: 3px 0; background: #1a1a2e; border-radius: 4px;
++    font-size: 0.8rem;
+   }
++  .group-list li .group-name { color: #00d4ff; }
++  .group-list li .group-members { color: #888; font-size: 0.75rem; margin-left: 6px; flex: 1; }
++  .group-list li .group-delete { cursor: pointer; color: #666; margin-left: 8px; }
++  .group-list li .group-delete:hover { color: #ff6b6b; }
++
++  .group-create-row { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
++  .group-create-row input {
++    flex: 1; min-width: 100px;
++    background: #1a1a2e; color: #e0e0e0; border: 1px solid #0f3460;
++    border-radius: 4px; padding: 5px 8px; font-size: 0.8rem; outline: none;
++  }
++  .group-create-row input:focus { border-color: #00d4ff; }
+ 
+-  .guide-content li { margin-bottom: 4px; }
+-  .guide-content code { color: #00d4ff; font-size: 0.82rem; }
++  .device-checkbox-list { list-style: none; padding: 0; margin: 6px 0; }
++  .device-checkbox-list li {
++    display: flex; align-items: center; gap: 6px;
++    padding: 3px 0; font-size: 0.8rem;
++  }
++  .device-checkbox-list input[type="checkbox"] { accent-color: #00d4ff; }
++
++  /* EQ panel */
++  .eq-device-section { margin: 8px 0; padding: 8px; background: #1a1a2e; border-radius: 4px; }
++  .eq-device-section .eq-name { font-size: 0.82rem; color: #ccc; margin-bottom: 6px; }
++  .eq-slider-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; font-size: 0.78rem; }
++  .eq-slider-row label { width: 45px; color: #888; }
++  .eq-slider-row input[type="range"] {
++    flex: 1; accent-color: #00d4ff;
++    -webkit-appearance: none; height: 4px; background: #0f3460; border-radius: 2px;
++  }
++  .eq-slider-row .eq-val { width: 36px; text-align: right; color: #aaa; font-size: 0.75rem; }
++
++  /* Keyboard help */
++  .kbd { display: inline-block; background: #0f3460; border-radius: 3px; padding: 1px 5px; font-size: 0.75rem; font-family: monospace; color: #ccc; }
++
++  /* Screen reader only */
++  .sr-only {
++    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
++    overflow: hidden; clip: rect(0,0,0,0); border: 0;
++  }
+ </style>
+ </head>
+ <body>
+ 
+ <h1>Bluetooth Crossfade Mixer</h1>
+-<p class="subtitle">Drag the control point to blend volume between speakers</p>
++<p class="subtitle">Drag the control point or use arrow keys to blend volume between speakers</p>
++
++<!-- Live region for screen readers -->
++<div id="ariaLive" class="sr-only" aria-live="polite" aria-atomic="true"></div>
++
++<canvas id="mixer" width="500" height="500" tabindex="0" role="application"
++  aria-label="Radial crossfade mixer. Use arrow keys to move the control point between speakers."></canvas>
++
++<div class="toolbar">
++  <button id="btnRefresh" aria-label="Refresh connected devices">Refresh</button>
++  <select id="selCurve" aria-label="Crossfade curve type">
++    <option value="inverse-square">Inverse Square</option>
++    <option value="linear">Linear</option>
++    <option value="logarithmic">Logarithmic</option>
++    <option value="equal-power">Equal Power</option>
++  </select>
++  <button id="btnCenterReset" aria-label="Reset control point to center">Center</button>
++</div>
+ 
+-<canvas id="mixer" width="500" height="500"></canvas>
++<div id="statusBar" class="status-bar">
++  <span class="ws-indicator disconnected" id="wsIndicator"></span>
++  Connecting...
++</div>
+ 
+-<div class="controls">
+-  <button id="btnRefresh">Refresh Devices</button>
++<div class="panel-row">
++  <!-- Presets Panel -->
++  <details id="presetsPanel">
++    <summary>Presets</summary>
++    <div class="panel-body">
++      <p>Save and recall control point positions.</p>
++      <ul class="preset-list" id="presetList"></ul>
++      <div class="preset-save-row">
++        <input type="text" id="presetNameInput" placeholder="Preset name..." maxlength="64" aria-label="Preset name">
++        <button id="btnSavePreset">Save</button>
++      </div>
++    </div>
++  </details>
++
++  <!-- Groups Panel -->
++  <details id="groupsPanel">
++    <summary>Device Groups</summary>
++    <div class="panel-body">
++      <p>Link speakers into zones that share the same volume.</p>
++      <ul class="group-list" id="groupList"></ul>
++      <div class="group-create-row">
++        <input type="text" id="groupNameInput" placeholder="Group name..." maxlength="64" aria-label="Group name">
++        <button id="btnCreateGroup">Create</button>
++      </div>
++      <ul class="device-checkbox-list" id="groupDeviceChecklist"></ul>
++    </div>
++  </details>
+ </div>
+ 
+-<div id="statusBar" class="status-bar">Connecting...</div>
+-
+-<details>
+-  <summary>Setup Guide &mdash; Multi-Output Audio on Windows</summary>
+-  <div class="guide-content">
+-    <p>Windows only routes audio to one output by default. To send audio to multiple speakers simultaneously, use one of these methods:</p>
+-
+-    <h3>Method 1: Stereo Mix (Built-in)</h3>
+-    <ol>
+-      <li>Right-click the speaker icon in the taskbar &rarr; <code>Sounds</code></li>
+-      <li>Go to the <code>Recording</code> tab</li>
+-      <li>Right-click and enable <code>Show Disabled Devices</code></li>
+-      <li>Enable <code>Stereo Mix</code></li>
+-      <li>Right-click Stereo Mix &rarr; <code>Properties</code> &rarr; <code>Listen</code> tab</li>
+-      <li>Check <code>Listen to this device</code> and select your secondary speaker</li>
+-      <li>Click Apply &mdash; audio now plays on both outputs</li>
+-    </ol>
+-
+-    <h3>Method 2: Voicemeeter (Third-Party)</h3>
+-    <ol>
+-      <li>Download and install <code>Voicemeeter</code> (free)</li>
+-      <li>Set Voicemeeter as your default playback device</li>
+-      <li>In Voicemeeter, assign multiple hardware outputs (A1, A2, etc.) to your Bluetooth speakers</li>
+-      <li>Audio is now routed to all assigned outputs</li>
+-    </ol>
+-
+-    <p>Once multi-output is configured, this mixer controls the volume balance between your speakers.</p>
+-  </div>
+-</details>
++<div class="panel-row">
++  <!-- EQ Panel -->
++  <details id="eqPanel">
++    <summary>Equalizer (per device)</summary>
++    <div class="panel-body">
++      <p>Adjust bass and treble per speaker. Requires <code>Equalizer APO</code> or <code>Voicemeeter</code> for actual audio processing.</p>
++      <div id="eqContainer"></div>
++    </div>
++  </details>
++
++  <!-- Setup Guide -->
++  <details>
++    <summary>Setup Guide</summary>
++    <div class="panel-body">
++      <p>Windows only routes audio to one output by default. To send audio to multiple speakers:</p>
++      <h3>Method 1: Stereo Mix (Built-in)</h3>
++      <ol>
++        <li>Right-click speaker icon &rarr; <code>Sounds</code></li>
++        <li><code>Recording</code> tab &rarr; right-click &rarr; <code>Show Disabled Devices</code></li>
++        <li>Enable <code>Stereo Mix</code></li>
++        <li>Properties &rarr; <code>Listen</code> &rarr; check <code>Listen to this device</code> &rarr; select secondary speaker</li>
++      </ol>
++      <h3>Method 2: Voicemeeter (Third-Party)</h3>
++      <ol>
++        <li>Install Voicemeeter (free) &rarr; set as default playback</li>
++        <li>Assign hardware outputs (A1, A2) to your speakers</li>
++      </ol>
++      <h3>Keyboard Shortcuts</h3>
++      <ul>
++        <li><span class="kbd">Arrow keys</span> Move control point</li>
++        <li><span class="kbd">Shift+Arrows</span> Fine movement</li>
++        <li><span class="kbd">Home</span> Center control point</li>
++        <li><span class="kbd">M</span> Toggle mute on nearest speaker</li>
++        <li><span class="kbd">1-9</span> Load preset by number</li>
++        <li><span class="kbd">Tab</span> Cycle focus to next speaker</li>
++      </ul>
++    </div>
++  </details>
++</div>
+ 
++<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+ <script>
+ (function () {
+   "use strict";
+ 
+   // -----------------------------------------------------------------------
+-  // State
++  // Constants
+   // -----------------------------------------------------------------------
+   const canvas = document.getElementById("mixer");
+   const ctx = canvas.getContext("2d");
+@@ -170,92 +313,219 @@
+   const RING_RADIUS = 190;
+   const NODE_RADIUS = 28;
+   const CP_RADIUS = 16;
+-  const EPSILON = 400; // prevents div-by-zero in inverse-square weighting
++  const EPSILON = 400;
++  const ARROW_STEP = 12;
++  const ARROW_FINE_STEP = 3;
+ 
++  // -----------------------------------------------------------------------
++  // State
++  // -----------------------------------------------------------------------
+   const state = {
+-    devices: [],           // [{id, name, volume, x, y, displayVol}]
+-    cp: { x: CX, y: CY }, // control point
++    devices: [],
++    cp: { x: CX, y: CY },
+     isDragging: false,
+     connected: false,
++    wsConnected: false,
+     lastError: null,
+-    lastSentVolumes: {},   // device_id -> last volume sent (for throttling)
++    lastSentVolumes: {},
++    curveType: "inverse-square",
++    mutedDevices: new Set(),
++    groups: {},
++    focusedDeviceIndex: -1,
+   };
+ 
+   const statusBar = document.getElementById("statusBar");
++  const wsIndicator = document.getElementById("wsIndicator");
++  const ariaLive = document.getElementById("ariaLive");
+ 
+   // -----------------------------------------------------------------------
+-  // Device fetching
++  // WebSocket
+   // -----------------------------------------------------------------------
++  let socket = null;
++  try {
++    socket = io({ transports: ["websocket", "polling"] });
++
++    socket.on("connect", () => {
++      state.wsConnected = true;
++      updateStatus();
++    });
+ 
++    socket.on("disconnect", () => {
++      state.wsConnected = false;
++      updateStatus();
++    });
++
++    socket.on("devices_updated", (devices) => {
++      layoutDevices(devices);
++      state.connected = true;
++      state.lastError = null;
++      updateStatus();
++      renderEQPanel();
++      renderGroupDeviceChecklist();
++    });
++
++    socket.on("groups_updated", (groups) => {
++      state.groups = groups || {};
++      renderGroupList();
++    });
++
++    socket.on("mute_changed", (data) => {
++      if (data.muted) {
++        state.mutedDevices.add(data.device_id);
++      } else {
++        state.mutedDevices.delete(data.device_id);
++      }
++    });
++
++    socket.on("eq_changed", (data) => {
++      const dev = state.devices.find(d => d.id === data.device_id);
++      if (dev) dev.eq = data.eq;
++    });
++
++    socket.on("device_reconnected", (data) => {
++      announce(`Device reconnected, volume restored to ${Math.round(data.restored_volume * 100)}%`);
++    });
++  } catch (e) {
++    // Fallback: no WebSocket support, use HTTP polling
++    console.warn("WebSocket unavailable, falling back to HTTP polling");
++  }
++
++  // -----------------------------------------------------------------------
++  // Accessibility announcements
++  // -----------------------------------------------------------------------
++  function announce(msg) {
++    ariaLive.textContent = msg;
++  }
++
++  // -----------------------------------------------------------------------
++  // Device layout
++  // -----------------------------------------------------------------------
++  function layoutDevices(devices) {
++    const n = devices.length;
++    devices.forEach((d, i) => {
++      const angle = (i * 2 * Math.PI) / n - Math.PI / 2;
++      d.x = CX + RING_RADIUS * Math.cos(angle);
++      d.y = CY + RING_RADIUS * Math.sin(angle);
++      const prev = state.devices.find(p => p.id === d.id);
++      d.displayVol = prev ? prev.displayVol : (d.volume ?? 0);
++      d.targetVol = prev ? prev.targetVol : (d.volume ?? 0);
++      // Preserve mute state from server
++      if (d.muted) state.mutedDevices.add(d.id);
++    });
++    state.devices = devices;
++  }
++
++  // -----------------------------------------------------------------------
++  // Device fetching (HTTP fallback)
++  // -----------------------------------------------------------------------
+   async function fetchDevices() {
+     try {
+       const res = await fetch("/api/devices");
+       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+       const devices = await res.json();
+-
+-      // Lay out devices evenly on the ring
+-      const n = devices.length;
+-      devices.forEach((d, i) => {
+-        const angle = (i * 2 * Math.PI) / n - Math.PI / 2; // start at top
+-        d.x = CX + RING_RADIUS * Math.cos(angle);
+-        d.y = CY + RING_RADIUS * Math.sin(angle);
+-        // Preserve smooth display volume from prior frame if device existed
+-        const prev = state.devices.find(p => p.id === d.id);
+-        d.displayVol = prev ? prev.displayVol : (d.volume ?? 0);
+-      });
+-
+-      state.devices = devices;
++      layoutDevices(devices);
+       state.connected = true;
+       state.lastError = null;
+       updateStatus();
+-    } catch (err) {
++      renderEQPanel();
++      renderGroupDeviceChecklist();
++    } catch {
+       state.connected = false;
+-      state.lastError = "Connection lost — retrying...";
++      state.lastError = "Connection lost \u2014 retrying...";
+       updateStatus();
+     }
+   }
+ 
+   function updateStatus() {
++    const wsSpan = `<span class="ws-indicator ${state.wsConnected ? 'connected' : 'disconnected'}" id="wsIndicator"></span>`;
+     if (!state.connected) {
+-      statusBar.textContent = state.lastError || "Disconnected";
++      statusBar.innerHTML = wsSpan + (state.lastError || "Disconnected");
+       statusBar.className = "status-bar error";
+     } else {
+       const n = state.devices.length;
+-      statusBar.textContent = n > 0
++      const muted = state.mutedDevices.size;
++      let text = n > 0
+         ? `${n} device${n !== 1 ? "s" : ""} connected`
+         : "No speakers detected";
++      if (muted > 0) text += ` \u00b7 ${muted} muted`;
++      text += ` \u00b7 ${state.curveType}`;
++      statusBar.innerHTML = wsSpan + text;
+       statusBar.className = "status-bar";
+     }
+   }
+ 
+   // -----------------------------------------------------------------------
+-  // Volume calculation & sending
++  // Crossfade curve functions
+   // -----------------------------------------------------------------------
++  const curves = {
++    "inverse-square": (distSq) => 1 / (distSq + EPSILON),
++    "linear": (distSq) => {
++      const dist = Math.sqrt(distSq);
++      const maxDist = RING_RADIUS * 2;
++      return Math.max(0, 1 - dist / maxDist);
++    },
++    "logarithmic": (distSq) => {
++      const dist = Math.sqrt(distSq);
++      return 1 / (1 + Math.log1p(dist) * 0.5);
++    },
++    "equal-power": (distSq) => {
++      const dist = Math.sqrt(distSq);
++      const maxDist = RING_RADIUS * 2;
++      const ratio = Math.min(1, dist / maxDist);
++      return Math.cos(ratio * Math.PI / 2);
++    },
++  };
+ 
++  // -----------------------------------------------------------------------
++  // Volume calculation
++  // -----------------------------------------------------------------------
+   function computeVolumes() {
+     if (state.devices.length === 0) return;
+ 
++    const curveFn = curves[state.curveType] || curves["inverse-square"];
++
+     const weights = state.devices.map(d => {
++      if (state.mutedDevices.has(d.id)) return 0;
+       const dx = state.cp.x - d.x;
+       const dy = state.cp.y - d.y;
+-      const distSq = dx * dx + dy * dy;
+-      return 1 / (distSq + EPSILON);
++      return curveFn(dx * dx + dy * dy);
+     });
+ 
+     const maxW = Math.max(...weights);
+ 
++    // Apply group logic: devices in the same group get the same (max) volume
++    const groupVolumes = {};
++
+     state.devices.forEach((d, i) => {
++      if (state.mutedDevices.has(d.id)) {
++        d.targetVol = 0;
++        return;
++      }
+       const normalized = maxW > 0 ? weights[i] / maxW : 0;
+       d.targetVol = normalized < 0.02 ? 0 : normalized;
++
++      // Track max volume per group
++      if (d.group) {
++        if (!groupVolumes[d.group] || d.targetVol > groupVolumes[d.group]) {
++          groupVolumes[d.group] = d.targetVol;
++        }
++      }
++    });
++
++    // Apply group volumes: all members of a group get the max volume
++    state.devices.forEach(d => {
++      if (d.group && groupVolumes[d.group] !== undefined) {
++        d.targetVol = groupVolumes[d.group];
++      }
+     });
+   }
+ 
+   async function sendVolumes() {
+     const toSend = [];
+     for (const d of state.devices) {
++      if (state.mutedDevices.has(d.id)) continue;
+       const target = d.targetVol ?? d.volume ?? 0;
+       const lastSent = state.lastSentVolumes[d.id];
+-      // Only send if changed by more than 1%
+       if (lastSent === undefined || Math.abs(target - lastSent) > 0.01) {
+         toSend.push({ device_id: d.id, volume: Math.round(target * 1000) / 1000 });
+         state.lastSentVolumes[d.id] = target;
+@@ -264,27 +534,29 @@
+ 
+     if (toSend.length === 0) return;
+ 
+-    try {
+-      await fetch("/api/volume/batch", {
+-        method: "POST",
+-        headers: { "Content-Type": "application/json" },
+-        body: JSON.stringify({ volumes: toSend }),
+-      });
+-    } catch {
+-      // Volume send failure is non-critical — next frame will retry
++    // Prefer WebSocket for lower latency
++    if (socket && socket.connected) {
++      socket.emit("set_volumes_batch", { volumes: toSend });
++    } else {
++      try {
++        await fetch("/api/volume/batch", {
++          method: "POST",
++          headers: { "Content-Type": "application/json" },
++          body: JSON.stringify({ volumes: toSend }),
++        });
++      } catch { /* retry next frame */ }
+     }
+   }
+ 
+   // -----------------------------------------------------------------------
+   // Drawing
+   // -----------------------------------------------------------------------
+-
+   function lerp(a, b, t) { return a + (b - a) * t; }
+ 
+   function draw() {
+     ctx.clearRect(0, 0, canvas.width, canvas.height);
+ 
+-    // Background ring
++    // Background rings
+     ctx.beginPath();
+     ctx.arc(CX, CY, RING_RADIUS + 30, 0, Math.PI * 2);
+     ctx.strokeStyle = "rgba(255,255,255,0.04)";
+@@ -307,8 +579,32 @@
+       return;
+     }
+ 
+-    // Connection lines from control point to each device
++    // Group arcs — draw colored arcs connecting grouped devices
++    const drawnGroups = new Set();
+     for (const d of state.devices) {
++      if (d.group && !drawnGroups.has(d.group)) {
++        drawnGroups.add(d.group);
++        const members = state.devices.filter(m => m.group === d.group);
++        if (members.length >= 2) {
++          const groupColor = stringToColor(d.group);
++          ctx.beginPath();
++          ctx.strokeStyle = groupColor + "40";
++          ctx.lineWidth = 3;
++          for (let i = 0; i < members.length; i++) {
++            const m = members[i];
++            if (i === 0) ctx.moveTo(m.x, m.y);
++            else ctx.lineTo(m.x, m.y);
++          }
++          ctx.closePath();
++          ctx.stroke();
++        }
++      }
++    }
++
++    // Connection lines
++    for (const d of state.devices) {
++      const isMuted = state.mutedDevices.has(d.id);
++      if (isMuted) continue;
+       const vol = d.displayVol ?? 0;
+       if (vol < 0.01) continue;
+ 
+@@ -321,13 +617,15 @@
+     }
+ 
+     // Device nodes
+-    for (const d of state.devices) {
+-      const target = d.targetVol ?? d.volume ?? 0;
++    state.devices.forEach((d, idx) => {
++      const isMuted = state.mutedDevices.has(d.id);
++      const target = isMuted ? 0 : (d.targetVol ?? d.volume ?? 0);
+       d.displayVol = lerp(d.displayVol ?? 0, target, 0.15);
+       const vol = d.displayVol;
++      const isFocused = idx === state.focusedDeviceIndex;
+ 
+       // Glow
+-      if (vol > 0.01) {
++      if (vol > 0.01 && !isMuted) {
+         const grad = ctx.createRadialGradient(d.x, d.y, NODE_RADIUS * 0.5, d.x, d.y, NODE_RADIUS * 2 + vol * 20);
+         grad.addColorStop(0, `rgba(0, 212, 255, ${vol * 0.4})`);
+         grad.addColorStop(1, "rgba(0, 212, 255, 0)");
+@@ -340,27 +638,52 @@
+       // Node circle
+       ctx.beginPath();
+       ctx.arc(d.x, d.y, NODE_RADIUS, 0, Math.PI * 2);
+-      const brightness = 30 + vol * 40;
+-      ctx.fillStyle = `hsl(195, 80%, ${brightness}%)`;
+-      ctx.fill();
+-      ctx.strokeStyle = vol > 0.01 ? `rgba(0, 212, 255, ${0.4 + vol * 0.6})` : "rgba(255,255,255,0.15)";
+-      ctx.lineWidth = 2;
++      if (isMuted) {
++        ctx.fillStyle = "#2a2a3e";
++        ctx.fill();
++        ctx.strokeStyle = "rgba(255,255,255,0.1)";
++      } else {
++        const brightness = 30 + vol * 40;
++        ctx.fillStyle = `hsl(195, 80%, ${brightness}%)`;
++        ctx.fill();
++        ctx.strokeStyle = vol > 0.01 ? `rgba(0, 212, 255, ${0.4 + vol * 0.6})` : "rgba(255,255,255,0.15)";
++      }
++      ctx.lineWidth = isFocused ? 3 : 2;
+       ctx.stroke();
+ 
+-      // Volume percentage inside node
+-      ctx.fillStyle = "#fff";
++      // Focus ring
++      if (isFocused) {
++        ctx.beginPath();
++        ctx.arc(d.x, d.y, NODE_RADIUS + 4, 0, Math.PI * 2);
++        ctx.strokeStyle = "#ff8c32";
++        ctx.lineWidth = 2;
++        ctx.stroke();
++      }
++
++      // Text inside node
++      ctx.fillStyle = isMuted ? "#666" : "#fff";
+       ctx.font = "bold 13px sans-serif";
+       ctx.textAlign = "center";
+       ctx.textBaseline = "middle";
+-      ctx.fillText(`${Math.round(vol * 100)}%`, d.x, d.y);
++      if (isMuted) {
++        ctx.fillText("MUTE", d.x, d.y);
++      } else {
++        ctx.fillText(`${Math.round(vol * 100)}%`, d.x, d.y);
++      }
+ 
+-      // Device name below node
+-      ctx.fillStyle = "#aaa";
++      // Device name
++      ctx.fillStyle = isMuted ? "#555" : "#aaa";
+       ctx.font = "11px sans-serif";
+-      ctx.textAlign = "center";
+       const name = d.name.length > 20 ? d.name.slice(0, 18) + "..." : d.name;
+       ctx.fillText(name, d.x, d.y + NODE_RADIUS + 14);
+-    }
++
++      // Group tag
++      if (d.group) {
++        ctx.fillStyle = stringToColor(d.group);
++        ctx.font = "9px sans-serif";
++        ctx.fillText(d.group, d.x, d.y + NODE_RADIUS + 26);
++      }
++    });
+ 
+     // Control point
+     const cpGrad = ctx.createRadialGradient(state.cp.x, state.cp.y, 2, state.cp.x, state.cp.y, CP_RADIUS);
+@@ -374,7 +697,7 @@
+     ctx.lineWidth = 2.5;
+     ctx.stroke();
+ 
+-    // Small crosshair inside control point
++    // Crosshair inside control point
+     ctx.strokeStyle = "rgba(0,0,0,0.3)";
+     ctx.lineWidth = 1;
+     ctx.beginPath();
+@@ -384,23 +707,33 @@
+     ctx.lineTo(state.cp.x, state.cp.y + 5);
+     ctx.stroke();
+ 
++    // Curve type label (small, bottom-right of canvas)
++    ctx.fillStyle = "rgba(255,255,255,0.15)";
++    ctx.font = "10px sans-serif";
++    ctx.textAlign = "right";
++    ctx.textBaseline = "bottom";
++    ctx.fillText(state.curveType, canvas.width - 16, canvas.height - 10);
++
+     requestAnimationFrame(draw);
+   }
+ 
++  function stringToColor(str) {
++    let hash = 0;
++    for (let i = 0; i < str.length; i++) hash = str.charCodeAt(i) + ((hash << 5) - hash);
++    const h = Math.abs(hash) % 360;
++    return `hsl(${h}, 70%, 60%)`;
++  }
++
+   // -----------------------------------------------------------------------
+-  // Interaction
++  // Pointer interaction
+   // -----------------------------------------------------------------------
+-
+   function getPointerPos(e) {
+     const rect = canvas.getBoundingClientRect();
+     const scaleX = canvas.width / rect.width;
+     const scaleY = canvas.height / rect.height;
+     const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+     const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+-    return {
+-      x: (clientX - rect.left) * scaleX,
+-      y: (clientY - rect.top) * scaleY,
+-    };
++    return { x: (clientX - rect.left) * scaleX, y: (clientY - rect.top) * scaleY };
+   }
+ 
+   function isNearCP(pos) {
+@@ -409,19 +742,47 @@
+     return dx * dx + dy * dy <= (CP_RADIUS + 10) * (CP_RADIUS + 10);
+   }
+ 
++  function isNearDevice(pos) {
++    for (let i = 0; i < state.devices.length; i++) {
++      const d = state.devices[i];
++      const dx = pos.x - d.x;
++      const dy = pos.y - d.y;
++      if (dx * dx + dy * dy <= (NODE_RADIUS + 6) * (NODE_RADIUS + 6)) return i;
++    }
++    return -1;
++  }
++
+   function clampToRing(x, y) {
+     const dx = x - CX;
+     const dy = y - CY;
+     const dist = Math.sqrt(dx * dx + dy * dy);
+     const maxDist = RING_RADIUS - 5;
+-    if (dist > maxDist) {
+-      return { x: CX + (dx / dist) * maxDist, y: CY + (dy / dist) * maxDist };
+-    }
++    if (dist > maxDist) return { x: CX + (dx / dist) * maxDist, y: CY + (dy / dist) * maxDist };
+     return { x, y };
+   }
+ 
++  function nearestDeviceIndex() {
++    let nearest = -1, minDist = Infinity;
++    state.devices.forEach((d, i) => {
++      const dx = state.cp.x - d.x;
++      const dy = state.cp.y - d.y;
++      const dist = dx * dx + dy * dy;
++      if (dist < minDist) { minDist = dist; nearest = i; }
++    });
++    return nearest;
++  }
++
++  // Mouse events
+   canvas.addEventListener("mousedown", (e) => {
+     const pos = getPointerPos(e);
++
++    // Check for click on device node (toggle mute)
++    const devIdx = isNearDevice(pos);
++    if (devIdx >= 0 && !isNearCP(pos)) {
++      toggleMute(state.devices[devIdx].id);
++      return;
++    }
++
+     if (isNearCP(pos)) {
+       state.isDragging = true;
+       canvas.style.cursor = "grabbing";
+@@ -436,27 +797,29 @@
+       state.cp.y = clamped.y;
+       computeVolumes();
+     } else {
+-      canvas.style.cursor = isNearCP(pos) ? "grab" : "default";
++      const devIdx = isNearDevice(pos);
++      if (isNearCP(pos)) canvas.style.cursor = "grab";
++      else if (devIdx >= 0) canvas.style.cursor = "pointer";
++      else canvas.style.cursor = "default";
+     }
+   });
+ 
+   canvas.addEventListener("mouseup", () => {
+-    state.isDragging = false;
++    if (state.isDragging) { state.isDragging = false; sendVolumes(); }
+     canvas.style.cursor = "default";
+   });
+ 
+   canvas.addEventListener("mouseleave", () => {
+-    state.isDragging = false;
++    if (state.isDragging) { state.isDragging = false; sendVolumes(); }
+     canvas.style.cursor = "default";
+   });
+ 
+-  // Touch support
++  // Touch events
+   canvas.addEventListener("touchstart", (e) => {
+     const pos = getPointerPos(e);
+-    if (isNearCP(pos)) {
+-      state.isDragging = true;
+-      e.preventDefault();
+-    }
++    const devIdx = isNearDevice(pos);
++    if (devIdx >= 0 && !isNearCP(pos)) { toggleMute(state.devices[devIdx].id); e.preventDefault(); return; }
++    if (isNearCP(pos)) { state.isDragging = true; e.preventDefault(); }
+   }, { passive: false });
+ 
+   canvas.addEventListener("touchmove", (e) => {
+@@ -470,16 +833,369 @@
+     }
+   }, { passive: false });
+ 
+-  canvas.addEventListener("touchend", () => { state.isDragging = false; });
++  canvas.addEventListener("touchend", () => {
++    if (state.isDragging) { state.isDragging = false; sendVolumes(); }
++  });
+ 
+   // -----------------------------------------------------------------------
+-  // Refresh button
++  // Keyboard controls
+   // -----------------------------------------------------------------------
++  canvas.addEventListener("keydown", (e) => {
++    const step = e.shiftKey ? ARROW_FINE_STEP : ARROW_STEP;
++    let handled = true;
++
++    switch (e.key) {
++      case "ArrowUp": {
++        const c = clampToRing(state.cp.x, state.cp.y - step);
++        state.cp.x = c.x; state.cp.y = c.y;
++        computeVolumes(); sendVolumes();
++        announcePosition();
++        break;
++      }
++      case "ArrowDown": {
++        const c = clampToRing(state.cp.x, state.cp.y + step);
++        state.cp.x = c.x; state.cp.y = c.y;
++        computeVolumes(); sendVolumes();
++        announcePosition();
++        break;
++      }
++      case "ArrowLeft": {
++        const c = clampToRing(state.cp.x - step, state.cp.y);
++        state.cp.x = c.x; state.cp.y = c.y;
++        computeVolumes(); sendVolumes();
++        announcePosition();
++        break;
++      }
++      case "ArrowRight": {
++        const c = clampToRing(state.cp.x + step, state.cp.y);
++        state.cp.x = c.x; state.cp.y = c.y;
++        computeVolumes(); sendVolumes();
++        announcePosition();
++        break;
++      }
++      case "Home": {
++        state.cp.x = CX; state.cp.y = CY;
++        computeVolumes(); sendVolumes();
++        announce("Control point centered");
++        break;
++      }
++      case "m":
++      case "M": {
++        const ni = nearestDeviceIndex();
++        if (ni >= 0) toggleMute(state.devices[ni].id);
++        break;
++      }
++      case "Tab": {
++        e.preventDefault();
++        if (state.devices.length > 0) {
++          state.focusedDeviceIndex = (state.focusedDeviceIndex + 1) % state.devices.length;
++          const d = state.devices[state.focusedDeviceIndex];
++          const vol = Math.round((d.displayVol ?? 0) * 100);
++          const muted = state.mutedDevices.has(d.id) ? ", muted" : "";
++          announce(`${d.name}, ${vol}%${muted}`);
++        }
++        break;
++      }
++      default: {
++        // Number keys 1-9 for presets
++        const num = parseInt(e.key);
++        if (num >= 1 && num <= 9) {
++          const presets = loadPresets();
++          if (num <= presets.length) {
++            applyPreset(presets[num - 1]);
++          }
++        } else {
++          handled = false;
++        }
++      }
++    }
++
++    if (handled) e.preventDefault();
++  });
++
++  function announcePosition() {
++    const nearest = nearestDeviceIndex();
++    if (nearest >= 0) {
++      const d = state.devices[nearest];
++      const vol = Math.round((d.targetVol ?? 0) * 100);
++      announce(`Nearest: ${d.name} at ${vol}%`);
++    }
++  }
++
++  // -----------------------------------------------------------------------
++  // Mute toggle
++  // -----------------------------------------------------------------------
++  async function toggleMute(deviceId) {
++    const isMuted = state.mutedDevices.has(deviceId);
++    const newMuted = !isMuted;
+ 
++    if (newMuted) state.mutedDevices.add(deviceId);
++    else state.mutedDevices.delete(deviceId);
++
++    const dev = state.devices.find(d => d.id === deviceId);
++    const name = dev ? dev.name : deviceId;
++    announce(`${name} ${newMuted ? "muted" : "unmuted"}`);
++
++    computeVolumes();
++    sendVolumes();
++    updateStatus();
++
++    try {
++      await fetch("/api/mute", {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ device_id: deviceId, muted: newMuted }),
++      });
++    } catch { /* ignore */ }
++  }
++
++  // -----------------------------------------------------------------------
++  // Presets (localStorage)
++  // -----------------------------------------------------------------------
++  const PRESETS_KEY = "bt-mixer-presets";
++
++  function loadPresets() {
++    try {
++      return JSON.parse(localStorage.getItem(PRESETS_KEY)) || [];
++    } catch { return []; }
++  }
++
++  function savePresets(presets) {
++    localStorage.setItem(PRESETS_KEY, JSON.stringify(presets.slice(0, 20)));
++    renderPresetList();
++  }
++
++  function applyPreset(preset) {
++    state.cp.x = preset.x;
++    state.cp.y = preset.y;
++    if (preset.curve) {
++      state.curveType = preset.curve;
++      document.getElementById("selCurve").value = preset.curve;
++    }
++    computeVolumes();
++    sendVolumes();
++    announce(`Loaded preset: ${preset.name}`);
++  }
++
++  function renderPresetList() {
++    const list = document.getElementById("presetList");
++    const presets = loadPresets();
++    list.innerHTML = "";
++    presets.forEach((p, i) => {
++      const li = document.createElement("li");
++      const nameSpan = document.createElement("span");
++      nameSpan.className = "preset-name";
++      nameSpan.textContent = `${i + 1}. ${p.name}`;
++      nameSpan.title = `Load preset "${p.name}" (or press ${i + 1})`;
++      nameSpan.addEventListener("click", () => applyPreset(p));
++
++      const delBtn = document.createElement("span");
++      delBtn.className = "preset-delete";
++      delBtn.textContent = "\u00d7";
++      delBtn.title = "Delete preset";
++      delBtn.addEventListener("click", () => {
++        const updated = loadPresets().filter((_, j) => j !== i);
++        savePresets(updated);
++      });
++
++      li.appendChild(nameSpan);
++      li.appendChild(delBtn);
++      list.appendChild(li);
++    });
++  }
++
++  document.getElementById("btnSavePreset").addEventListener("click", () => {
++    const input = document.getElementById("presetNameInput");
++    const name = input.value.trim();
++    if (!name) return;
++    const presets = loadPresets();
++    presets.push({
++      name,
++      x: state.cp.x,
++      y: state.cp.y,
++      curve: state.curveType,
++    });
++    savePresets(presets);
++    input.value = "";
++    announce(`Saved preset: ${name}`);
++  });
++
++  // -----------------------------------------------------------------------
++  // Crossfade curve selector
++  // -----------------------------------------------------------------------
++  document.getElementById("selCurve").addEventListener("change", (e) => {
++    state.curveType = e.target.value;
++    computeVolumes();
++    sendVolumes();
++    updateStatus();
++    announce(`Crossfade curve: ${state.curveType}`);
++  });
++
++  // -----------------------------------------------------------------------
++  // Center reset button
++  // -----------------------------------------------------------------------
++  document.getElementById("btnCenterReset").addEventListener("click", () => {
++    state.cp.x = CX;
++    state.cp.y = CY;
++    computeVolumes();
++    sendVolumes();
++    announce("Control point centered");
++  });
++
++  // -----------------------------------------------------------------------
++  // Groups
++  // -----------------------------------------------------------------------
++  function renderGroupList() {
++    const list = document.getElementById("groupList");
++    list.innerHTML = "";
++    for (const [name, members] of Object.entries(state.groups)) {
++      const li = document.createElement("li");
++      const nameSpan = document.createElement("span");
++      nameSpan.className = "group-name";
++      nameSpan.textContent = name;
++
++      const membersSpan = document.createElement("span");
++      membersSpan.className = "group-members";
++      const memberNames = members.map(mid => {
++        const dev = state.devices.find(d => d.id === mid);
++        return dev ? dev.name : mid.slice(0, 12) + "...";
++      });
++      membersSpan.textContent = memberNames.join(", ");
++
++      const delBtn = document.createElement("span");
++      delBtn.className = "group-delete";
++      delBtn.textContent = "\u00d7";
++      delBtn.addEventListener("click", async () => {
++        try {
++          await fetch(`/api/groups/${encodeURIComponent(name)}`, { method: "DELETE" });
++        } catch { /* ignore */ }
++      });
++
++      li.appendChild(nameSpan);
++      li.appendChild(membersSpan);
++      li.appendChild(delBtn);
++      list.appendChild(li);
++    }
++  }
++
++  function renderGroupDeviceChecklist() {
++    const list = document.getElementById("groupDeviceChecklist");
++    list.innerHTML = "";
++    state.devices.forEach(d => {
++      const li = document.createElement("li");
++      const cb = document.createElement("input");
++      cb.type = "checkbox";
++      cb.value = d.id;
++      cb.id = "gcb_" + d.id;
++      const label = document.createElement("label");
++      label.htmlFor = cb.id;
++      label.textContent = d.name;
++      li.appendChild(cb);
++      li.appendChild(label);
++      list.appendChild(li);
++    });
++  }
++
++  document.getElementById("btnCreateGroup").addEventListener("click", async () => {
++    const nameInput = document.getElementById("groupNameInput");
++    const name = nameInput.value.trim();
++    if (!name) return;
++
++    const checklist = document.getElementById("groupDeviceChecklist");
++    const checked = Array.from(checklist.querySelectorAll("input:checked")).map(cb => cb.value);
++    if (checked.length < 2) {
++      announce("Select at least 2 devices for a group");
++      return;
++    }
++
++    try {
++      await fetch("/api/groups", {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ name, device_ids: checked }),
++      });
++      nameInput.value = "";
++      // Uncheck all
++      checklist.querySelectorAll("input:checked").forEach(cb => cb.checked = false);
++      announce(`Created group: ${name}`);
++    } catch { /* ignore */ }
++  });
++
++  // -----------------------------------------------------------------------
++  // EQ Panel
++  // -----------------------------------------------------------------------
++  function renderEQPanel() {
++    const container = document.getElementById("eqContainer");
++    container.innerHTML = "";
++
++    state.devices.forEach(d => {
++      const section = document.createElement("div");
++      section.className = "eq-device-section";
++
++      const nameDiv = document.createElement("div");
++      nameDiv.className = "eq-name";
++      nameDiv.textContent = d.name;
++      section.appendChild(nameDiv);
++
++      const eq = d.eq || { bass: 0, treble: 0 };
++
++      ["bass", "treble"].forEach(param => {
++        const row = document.createElement("div");
++        row.className = "eq-slider-row";
++
++        const label = document.createElement("label");
++        label.textContent = param.charAt(0).toUpperCase() + param.slice(1);
++
++        const slider = document.createElement("input");
++        slider.type = "range";
++        slider.min = "-100";
++        slider.max = "100";
++        slider.value = String(Math.round(eq[param] * 100));
++        slider.setAttribute("aria-label", `${d.name} ${param}`);
++
++        const valSpan = document.createElement("span");
++        valSpan.className = "eq-val";
++        valSpan.textContent = (eq[param] >= 0 ? "+" : "") + eq[param].toFixed(1);
++
++        slider.addEventListener("input", () => {
++          const val = parseInt(slider.value) / 100;
++          valSpan.textContent = (val >= 0 ? "+" : "") + val.toFixed(1);
++        });
++
++        slider.addEventListener("change", async () => {
++          const val = parseInt(slider.value) / 100;
++          const body = { device_id: d.id };
++          body[param] = val;
++          try {
++            await fetch("/api/eq", {
++              method: "POST",
++              headers: { "Content-Type": "application/json" },
++              body: JSON.stringify(body),
++            });
++          } catch { /* ignore */ }
++        });
++
++        row.appendChild(label);
++        row.appendChild(slider);
++        row.appendChild(valSpan);
++        section.appendChild(row);
++      });
++
++      container.appendChild(section);
++    });
++  }
++
++  // -----------------------------------------------------------------------
++  // Refresh button
++  // -----------------------------------------------------------------------
+   document.getElementById("btnRefresh").addEventListener("click", async () => {
+     try {
+-      const res = await fetch("/api/refresh", { method: "POST" });
+-      if (res.ok) await fetchDevices();
++      if (socket && socket.connected) {
++        socket.emit("request_refresh");
++      } else {
++        const res = await fetch("/api/refresh", { method: "POST" });
++        if (res.ok) await fetchDevices();
++      }
+     } catch { /* ignore */ }
+   });
+ 
+@@ -487,20 +1203,23 @@
+   // Main loop
+   // -----------------------------------------------------------------------
+ 
+-  // Send volume updates at ~30fps while dragging
+-  let volumeInterval = setInterval(() => {
+-    if (state.isDragging) sendVolumes();
+-  }, 33);
+-
+-  // Also send final volumes when drag ends
+-  canvas.addEventListener("mouseup", () => sendVolumes());
+-  canvas.addEventListener("touchend", () => sendVolumes());
++  // Volume updates at ~30fps while dragging
++  setInterval(() => { if (state.isDragging) sendVolumes(); }, 33);
+ 
+-  // Poll devices every 5 seconds
++  // HTTP polling fallback (only if WebSocket is not connected)
+   fetchDevices();
+-  setInterval(fetchDevices, 5000);
+-
+-  // Start render loop
++  setInterval(() => {
++    if (!socket || !socket.connected) fetchDevices();
++  }, 5000);
++
++  // Fetch groups on load
++  fetch("/api/groups").then(r => r.json()).then(g => {
++    state.groups = g || {};
++    renderGroupList();
++  }).catch(() => {});
++
++  // Init UI
++  renderPresetList();
+   requestAnimationFrame(draw);
+ })();
+ </script>
+diff --git a/test_server.py b/test_server.py
+index 0327e22..31b6437 100644
+--- a/test_server.py
++++ b/test_server.py
+@@ -22,6 +22,15 @@ sys.modules["pycaw"] = MagicMock()
+ sys.modules["pycaw.pycaw"] = mock_pycaw
+ sys.modules["pycaw.constants"] = mock_pycaw_constants
+ 
++# Mock flask-socketio
++mock_socketio_module = MagicMock()
++mock_socketio_class = MagicMock()
++mock_socketio_instance = MagicMock()
++mock_socketio_class.return_value = mock_socketio_instance
++mock_socketio_module.SocketIO = mock_socketio_class
++mock_socketio_module.emit = MagicMock()
++sys.modules["flask_socketio"] = mock_socketio_module
++
+ import server
+ 
+ 
+@@ -40,11 +49,18 @@ class TestAPIRoutes(unittest.TestCase):
+     def setUp(self):
+         server.app.testing = True
+         self.client = server.app.test_client()
++        # Reset state between tests
++        server._muted_devices.clear()
++        server._device_groups.clear()
++        server._last_volumes.clear()
++        server._device_eq.clear()
++        server._previous_device_ids.clear()
+ 
+     @patch.object(server, "get_playback_devices")
+     def test_get_devices(self, mock_get):
+         mock_get.return_value = [
+-            {"id": "dev1", "name": "Speaker A", "volume": 0.75},
++            {"id": "dev1", "name": "Speaker A", "volume": 0.75,
++             "muted": False, "group": None, "eq": {"bass": 0.0, "treble": 0.0}},
+         ]
+         resp = self.client.get("/api/devices")
+         self.assertEqual(resp.status_code, 200)
+@@ -61,8 +77,7 @@ class TestAPIRoutes(unittest.TestCase):
+             content_type="application/json",
+         )
+         self.assertEqual(resp.status_code, 200)
+-        data = json.loads(resp.data)
+-        self.assertTrue(data["success"])
++        self.assertTrue(json.loads(resp.data)["success"])
+ 
+     def test_set_volume_missing_body(self):
+         resp = self.client.post("/api/volume", content_type="application/json")
+@@ -120,8 +135,7 @@ class TestAPIRoutes(unittest.TestCase):
+             content_type="application/json",
+         )
+         self.assertEqual(resp.status_code, 200)
+-        data = json.loads(resp.data)
+-        self.assertTrue(data["success"])
++        self.assertTrue(json.loads(resp.data)["success"])
+ 
+     def test_batch_volume_missing_body(self):
+         resp = self.client.post("/api/volume/batch", content_type="application/json")
+@@ -140,6 +154,9 @@ class TestAPIRoutes(unittest.TestCase):
+ 
+ 
+ class TestSetDeviceVolume(unittest.TestCase):
++    def setUp(self):
++        server._last_volumes.clear()
++
+     @patch.object(server, "_get_active_render_devices")
+     def test_clamps_volume(self, mock_enum):
+         dev = _make_mock_device("dev1", "Speaker", 0.5)
+@@ -160,8 +177,18 @@ class TestSetDeviceVolume(unittest.TestCase):
+         result = server.set_device_volume("nonexistent", 0.5)
+         self.assertFalse(result)
+ 
++    @patch.object(server, "_get_active_render_devices")
++    def test_remembers_volume_for_reconnect(self, mock_enum):
++        dev = _make_mock_device("dev1", "Speaker", 0.5)
++        mock_enum.return_value = [dev]
++        server.set_device_volume("dev1", 0.75)
++        self.assertEqual(server._last_volumes["dev1"], 0.75)
++
+ 
+ class TestSetVolumesBatch(unittest.TestCase):
++    def setUp(self):
++        server._last_volumes.clear()
++
+     @patch.object(server, "_get_active_render_devices")
+     def test_batch_sets_multiple(self, mock_enum):
+         dev1 = _make_mock_device("dev1", "A")
+@@ -184,6 +211,205 @@ class TestSetVolumesBatch(unittest.TestCase):
+         results = server.set_volumes_batch([{"device_id": "dev1", "volume": 0.5}])
+         self.assertFalse(results["dev1"])
+ 
++    @patch.object(server, "_get_active_render_devices")
++    def test_batch_remembers_volumes(self, mock_enum):
++        dev = _make_mock_device("dev1", "A")
++        mock_enum.return_value = [dev]
++        server.set_volumes_batch([{"device_id": "dev1", "volume": 0.6}])
++        self.assertEqual(server._last_volumes["dev1"], 0.6)
++
++
++class TestMuteAPI(unittest.TestCase):
++    def setUp(self):
++        server.app.testing = True
++        self.client = server.app.test_client()
++        server._muted_devices.clear()
++
++    @patch.object(server, "set_device_volume")
++    def test_mute_device(self, mock_set):
++        mock_set.return_value = True
++        resp = self.client.post(
++            "/api/mute",
++            data=json.dumps({"device_id": "dev1", "muted": True}),
++            content_type="application/json",
++        )
++        self.assertEqual(resp.status_code, 200)
++        data = json.loads(resp.data)
++        self.assertTrue(data["success"])
++        self.assertTrue(data["muted"])
++        self.assertIn("dev1", server._muted_devices)
++
++    @patch.object(server, "set_device_volume")
++    def test_unmute_device(self, mock_set):
++        server._muted_devices.add("dev1")
++        resp = self.client.post(
++            "/api/mute",
++            data=json.dumps({"device_id": "dev1", "muted": False}),
++            content_type="application/json",
++        )
++        self.assertEqual(resp.status_code, 200)
++        self.assertNotIn("dev1", server._muted_devices)
++
++    def test_mute_invalid_body(self):
++        resp = self.client.post("/api/mute", content_type="application/json")
++        self.assertEqual(resp.status_code, 400)
++
++    def test_mute_invalid_muted_type(self):
++        resp = self.client.post(
++            "/api/mute",
++            data=json.dumps({"device_id": "dev1", "muted": "yes"}),
++            content_type="application/json",
++        )
++        self.assertEqual(resp.status_code, 400)
++
++
++class TestGroupsAPI(unittest.TestCase):
++    def setUp(self):
++        server.app.testing = True
++        self.client = server.app.test_client()
++        server._device_groups.clear()
++
++    def test_create_group(self):
++        resp = self.client.post(
++            "/api/groups",
++            data=json.dumps({"name": "Living Room", "device_ids": ["dev1", "dev2"]}),
++            content_type="application/json",
++        )
++        self.assertEqual(resp.status_code, 200)
++        data = json.loads(resp.data)
++        self.assertTrue(data["success"])
++        self.assertIn("Living Room", data["groups"])
++
++    def test_list_groups(self):
++        server._device_groups["Zone A"] = ["dev1"]
++        resp = self.client.get("/api/groups")
++        self.assertEqual(resp.status_code, 200)
++        data = json.loads(resp.data)
++        self.assertIn("Zone A", data)
++
++    def test_delete_group(self):
++        server._device_groups["Zone A"] = ["dev1"]
++        resp = self.client.delete("/api/groups/Zone%20A")
++        self.assertEqual(resp.status_code, 200)
++        self.assertNotIn("Zone A", server._device_groups)
++
++    def test_create_group_invalid_name(self):
++        resp = self.client.post(
++            "/api/groups",
++            data=json.dumps({"name": "", "device_ids": ["dev1"]}),
++            content_type="application/json",
++        )
++        self.assertEqual(resp.status_code, 400)
++
++    def test_create_group_name_too_long(self):
++        resp = self.client.post(
++            "/api/groups",
++            data=json.dumps({"name": "x" * 100, "device_ids": ["dev1"]}),
++            content_type="application/json",
++        )
++        self.assertEqual(resp.status_code, 400)
++
++    def test_create_group_moves_devices_from_old_group(self):
++        server._device_groups["Old"] = ["dev1", "dev2"]
++        self.client.post(
++            "/api/groups",
++            data=json.dumps({"name": "New", "device_ids": ["dev1"]}),
++            content_type="application/json",
++        )
++        # dev1 should be removed from "Old" and added to "New"
++        self.assertNotIn("dev1", server._device_groups.get("Old", []))
++        self.assertIn("dev1", server._device_groups["New"])
++
++
++class TestEQAPI(unittest.TestCase):
++    def setUp(self):
++        server.app.testing = True
++        self.client = server.app.test_client()
++        server._device_eq.clear()
++
++    def test_set_eq(self):
++        resp = self.client.post(
++            "/api/eq",
++            data=json.dumps({"device_id": "dev1", "bass": 0.5, "treble": -0.3}),
++            content_type="application/json",
++        )
++        self.assertEqual(resp.status_code, 200)
++        data = json.loads(resp.data)
++        self.assertTrue(data["success"])
++        self.assertEqual(data["eq"]["bass"], 0.5)
++        self.assertEqual(data["eq"]["treble"], -0.3)
++
++    def test_get_eq_default(self):
++        resp = self.client.get("/api/eq/dev1")
++        self.assertEqual(resp.status_code, 200)
++        data = json.loads(resp.data)
++        self.assertEqual(data["bass"], 0.0)
++        self.assertEqual(data["treble"], 0.0)
++
++    def test_set_eq_clamps(self):
++        resp = self.client.post(
++            "/api/eq",
++            data=json.dumps({"device_id": "dev1", "bass": 5.0, "treble": -5.0}),
++            content_type="application/json",
++        )
++        data = json.loads(resp.data)
++        self.assertEqual(data["eq"]["bass"], 1.0)
++        self.assertEqual(data["eq"]["treble"], -1.0)
++
++    def test_set_eq_invalid_body(self):
++        resp = self.client.post("/api/eq", content_type="application/json")
++        self.assertEqual(resp.status_code, 400)
++
++    def test_set_eq_invalid_device_id(self):
++        resp = self.client.post(
++            "/api/eq",
++            data=json.dumps({"device_id": 123, "bass": 0.0}),
++            content_type="application/json",
++        )
++        self.assertEqual(resp.status_code, 400)
++
++
++class TestAutoReconnect(unittest.TestCase):
++    def setUp(self):
++        server._last_volumes.clear()
++        server._previous_device_ids.clear()
++
++    @patch.object(server, "socketio")
++    def test_reconnect_restores_volume(self, mock_sio):
++        # Simulate: dev1 was known with volume 0.8, then disappeared, now reappears
++        server._last_volumes["dev1"] = 0.8
++        server._previous_device_ids.update(set())  # empty = first scan
++
++        dev1 = _make_mock_device("dev1", "Speaker A", 0.5)
++        current_ids = {"dev1"}
++
++        # First call to establish baseline
++        server._handle_reconnections(current_ids, [dev1])
++
++        # Now simulate dev1 disappearing and reappearing
++        server._previous_device_ids.clear()  # it disappeared
++        server._handle_reconnections(current_ids, [dev1])
++
++        # Volume should have been restored
++        dev1.EndpointVolume.SetMasterVolumeLevelScalar.assert_called_with(0.8, None)
++
++
++class TestValidateDeviceId(unittest.TestCase):
++    def test_valid(self):
++        self.assertTrue(server._validate_device_id("abc123"))
++
++    def test_too_long(self):
++        self.assertFalse(server._validate_device_id("x" * 600))
++
++    def test_not_string(self):
++        self.assertFalse(server._validate_device_id(123))
++
++    def test_empty(self):
++        self.assertFalse(server._validate_device_id(""))
++
++    def test_none(self):
++        self.assertFalse(server._validate_device_id(None))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.43.0
+
+
+From 958bfd248a9a542267fa04b3122178953129317d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Mar 2026 23:06:11 +0000
+Subject: [PATCH 3/6] fix: resolve bugs, race conditions, and optimize
+ performance
+
+Bugs fixed:
+- Race condition: _device_groups dict emitted outside its lock in
+  api_groups_create and api_groups_delete (copy inside lock now)
+- Invalid CSS: group arc color used hsl() + "40" string concat producing
+  broken color values; replaced with hsla() alpha parameter
+- EQ sliders and group checkboxes lost user state on every 3s device
+  update; panels now only re-render when the device list actually changes
+
+Performance optimizations:
+- get_playback_devices: snapshot muted/eq/groups state once before loop
+  instead of acquiring 3 locks per device (O(n) lock ops -> O(1))
+- Group membership lookup: replaced O(n*m) linear scan with O(1) reverse
+  dict lookup built during snapshot
+- set_volumes_batch: batch _volumes_lock acquisition after loop instead
+  of per-device lock acquire/release
+- Device monitor: replaced full json.dumps serialization with lightweight
+  tuple-based snapshot key for change detection
+- layoutDevices: replaced O(n^2) Array.find with O(n) Map lookup
+
+Dead code removed:
+- _MAX_PRESET_NAME_LEN, _MAX_PRESETS constants (presets are client-only)
+- Unused wsIndicator DOM reference (overwritten by innerHTML)
+- Unused json import (was only for monitor serialization)
+- f-string with no interpolation in group validation
+
+https://claude.ai/code/session_01S7VjSQ7Bf5X2V5UZjp8yoZ
+---
+ server.py            | 71 +++++++++++++++++++++++++-------------------
+ templates/index.html | 29 +++++++++++-------
+ 2 files changed, 59 insertions(+), 41 deletions(-)
+
+diff --git a/server.py b/server.py
+index f10bd7b..813af72 100644
+--- a/server.py
++++ b/server.py
+@@ -7,7 +7,6 @@ Features: crossfade curves, mute, presets, groups, WebSocket, EQ, auto-reconnect
+ import logging
+ import webbrowser
+ import threading
+-import json
+ import os
+ from flask import Flask, render_template, jsonify, request
+ from flask_socketio import SocketIO, emit
+@@ -42,8 +41,6 @@ _com_initialized = threading.local()
+ # Maximum length for device_id strings to prevent abuse
+ _MAX_DEVICE_ID_LEN = 512
+ _MAX_GROUP_NAME_LEN = 64
+-_MAX_PRESET_NAME_LEN = 64
+-_MAX_PRESETS = 20
+ _MAX_GROUPS = 20
+ 
+ # Muted devices: set of device_id
+@@ -106,6 +103,18 @@ def get_playback_devices():
+ 
+     current_ids = set()
+ 
++    # Snapshot shared state once to avoid per-device lock contention
++    with _muted_lock:
++        muted_snapshot = set(_muted_devices)
++    with _eq_lock:
++        eq_snapshot = dict(_device_eq)
++    with _groups_lock:
++        # Build reverse lookup: device_id -> group_name
++        device_to_group = {}
++        for gname, members in _device_groups.items():
++            for mid in members:
++                device_to_group[mid] = gname
++
+     for device in all_devices:
+         try:
+             friendly_name = device.FriendlyName
+@@ -123,27 +132,13 @@ def get_playback_devices():
+             except Exception:
+                 pass
+ 
+-            with _muted_lock:
+-                is_muted = device_id in _muted_devices
+-
+-            with _eq_lock:
+-                eq = _device_eq.get(device_id, {"bass": 0.0, "treble": 0.0})
+-
+-            # Find which group this device belongs to
+-            group_name = None
+-            with _groups_lock:
+-                for gname, members in _device_groups.items():
+-                    if device_id in members:
+-                        group_name = gname
+-                        break
+-
+             devices_info.append({
+                 "id": device_id,
+                 "name": friendly_name,
+                 "volume": round(volume_level, 4) if volume_level is not None else None,
+-                "muted": is_muted,
+-                "group": group_name,
+-                "eq": eq,
++                "muted": device_id in muted_snapshot,
++                "group": device_to_group.get(device_id),
++                "eq": eq_snapshot.get(device_id, {"bass": 0.0, "treble": 0.0}),
+             })
+ 
+         except Exception as exc:
+@@ -248,6 +243,7 @@ def set_volumes_batch(volumes):
+         log.error("Failed to enumerate devices: %s", exc)
+         return {did: False for did in lookup}
+ 
++    successfully_set = {}
+     for device in all_devices:
+         try:
+             if device.id in lookup:
+@@ -257,13 +253,16 @@ def set_volumes_batch(volumes):
+                 else:
+                     endpoint_volume.SetMasterVolumeLevelScalar(lookup[device.id], None)
+                     results[device.id] = True
+-                    # Remember volume for auto-reconnect
+-                    with _volumes_lock:
+-                        _last_volumes[device.id] = lookup[device.id]
++                    successfully_set[device.id] = lookup[device.id]
+         except Exception as exc:
+             log.error("Error setting volume on %s: %s", device.id, exc)
+             results[device.id] = False
+ 
++    # Batch-update remembered volumes for auto-reconnect
++    if successfully_set:
++        with _volumes_lock:
++            _last_volumes.update(successfully_set)
++
+     for did in lookup:
+         if did not in results:
+             results[did] = False
+@@ -426,7 +425,7 @@ def api_groups_create():
+ 
+     for did in device_ids:
+         if not _validate_device_id(did):
+-            return jsonify({"success": False, "error": f"Invalid device_id in group"}), 400
++            return jsonify({"success": False, "error": "Invalid device_id in group"}), 400
+ 
+     name = name.strip()
+ 
+@@ -440,9 +439,10 @@ def api_groups_create():
+                 del _device_groups[gname]
+         if device_ids:
+             _device_groups[name] = device_ids
++        groups_copy = dict(_device_groups)
+ 
+-    socketio.emit("groups_updated", _device_groups)
+-    return jsonify({"success": True, "groups": _device_groups})
++    socketio.emit("groups_updated", groups_copy)
++    return jsonify({"success": True, "groups": groups_copy})
+ 
+ 
+ @app.route("/api/groups/<name>", methods=["DELETE"])
+@@ -451,7 +451,8 @@ def api_groups_delete(name):
+     with _groups_lock:
+         if name in _device_groups:
+             del _device_groups[name]
+-    socketio.emit("groups_updated", _device_groups)
++        groups_copy = dict(_device_groups)
++    socketio.emit("groups_updated", groups_copy)
+     return jsonify({"success": True})
+ 
+ 
+@@ -552,15 +553,23 @@ def ws_set_volumes_batch(data):
+ _monitor_interval = 3.0  # seconds
+ 
+ 
++def _device_snapshot_key(devices):
++    """Return a lightweight hashable key for change detection."""
++    return tuple(
++        (d["id"], d["name"], d["volume"], d["muted"], d["group"])
++        for d in devices
++    )
++
++
+ def _device_monitor():
+     """Periodically check for device changes and push updates via WebSocket."""
+-    prev_snapshot = None
++    prev_key = None
+     while True:
+         try:
+             devices = get_playback_devices()
+-            snapshot = json.dumps(devices, sort_keys=True)
+-            if snapshot != prev_snapshot:
+-                prev_snapshot = snapshot
++            key = _device_snapshot_key(devices)
++            if key != prev_key:
++                prev_key = key
+                 socketio.emit("devices_updated", devices)
+         except Exception as exc:
+             log.error("Device monitor error: %s", exc)
+diff --git a/templates/index.html b/templates/index.html
+index 6164514..5272ce5 100644
+--- a/templates/index.html
++++ b/templates/index.html
+@@ -335,7 +335,6 @@
+   };
+ 
+   const statusBar = document.getElementById("statusBar");
+-  const wsIndicator = document.getElementById("wsIndicator");
+   const ariaLive = document.getElementById("ariaLive");
+ 
+   // -----------------------------------------------------------------------
+@@ -356,12 +355,17 @@
+     });
+ 
+     socket.on("devices_updated", (devices) => {
++      const prevIds = state.devices.map(d => d.id).join(",");
+       layoutDevices(devices);
+       state.connected = true;
+       state.lastError = null;
+       updateStatus();
+-      renderEQPanel();
+-      renderGroupDeviceChecklist();
++      // Only re-render panels if the device list changed (avoids losing user state)
++      const newIds = devices.map(d => d.id).join(",");
++      if (prevIds !== newIds) {
++        renderEQPanel();
++        renderGroupDeviceChecklist();
++      }
+     });
+ 
+     socket.on("groups_updated", (groups) => {
+@@ -402,14 +406,15 @@
+   // -----------------------------------------------------------------------
+   function layoutDevices(devices) {
+     const n = devices.length;
++    // Build lookup map from previous devices for O(1) access
++    const prevMap = new Map(state.devices.map(p => [p.id, p]));
+     devices.forEach((d, i) => {
+       const angle = (i * 2 * Math.PI) / n - Math.PI / 2;
+       d.x = CX + RING_RADIUS * Math.cos(angle);
+       d.y = CY + RING_RADIUS * Math.sin(angle);
+-      const prev = state.devices.find(p => p.id === d.id);
++      const prev = prevMap.get(d.id);
+       d.displayVol = prev ? prev.displayVol : (d.volume ?? 0);
+       d.targetVol = prev ? prev.targetVol : (d.volume ?? 0);
+-      // Preserve mute state from server
+       if (d.muted) state.mutedDevices.add(d.id);
+     });
+     state.devices = devices;
+@@ -423,12 +428,16 @@
+       const res = await fetch("/api/devices");
+       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+       const devices = await res.json();
++      const prevIds = state.devices.map(d => d.id).join(",");
+       layoutDevices(devices);
+       state.connected = true;
+       state.lastError = null;
+       updateStatus();
+-      renderEQPanel();
+-      renderGroupDeviceChecklist();
++      const newIds = devices.map(d => d.id).join(",");
++      if (prevIds !== newIds) {
++        renderEQPanel();
++        renderGroupDeviceChecklist();
++      }
+     } catch {
+       state.connected = false;
+       state.lastError = "Connection lost \u2014 retrying...";
+@@ -586,9 +595,8 @@
+         drawnGroups.add(d.group);
+         const members = state.devices.filter(m => m.group === d.group);
+         if (members.length >= 2) {
+-          const groupColor = stringToColor(d.group);
+           ctx.beginPath();
+-          ctx.strokeStyle = groupColor + "40";
++          ctx.strokeStyle = stringToColor(d.group, 0.25);
+           ctx.lineWidth = 3;
+           for (let i = 0; i < members.length; i++) {
+             const m = members[i];
+@@ -717,10 +725,11 @@
+     requestAnimationFrame(draw);
+   }
+ 
+-  function stringToColor(str) {
++  function stringToColor(str, alpha) {
+     let hash = 0;
+     for (let i = 0; i < str.length; i++) hash = str.charCodeAt(i) + ((hash << 5) - hash);
+     const h = Math.abs(hash) % 360;
++    if (alpha !== undefined) return `hsla(${h}, 70%, 60%, ${alpha})`;
+     return `hsl(${h}, 70%, 60%)`;
+   }
+ 
+-- 
+2.43.0
+
+
+From b1ee27a5e8a73923b6aac93913c88cd0549ecb0f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Mar 2026 23:17:16 +0000
+Subject: [PATCH 4/6] feat: add Spotify integration, playback controls, and
+ audio level visualization
+
+- Spotify OAuth 2.0 PKCE flow with login/callback/disconnect endpoints
+- Now-playing display with track, artist, album art, and progress bar
+- Playback controls (play/pause/skip) via Spotify Web API
+- Real-time audio level metering via IAudioMeterInformation
+- Audio level rings rendered around device nodes on canvas
+- Background monitors for Spotify polling and audio level push via WebSocket
+- 18 new tests covering all Spotify and audio level endpoints (58 total)
+- Added requests>=2.31 to requirements.txt
+
+https://claude.ai/code/session_01S7VjSQ7Bf5X2V5UZjp8yoZ
+---
+ requirements.txt     |   1 +
+ server.py            | 390 ++++++++++++++++++++++++++++++++++++++++++-
+ templates/index.html | 222 ++++++++++++++++++++++++
+ test_server.py       | 133 +++++++++++++++
+ 4 files changed, 743 insertions(+), 3 deletions(-)
+
+diff --git a/requirements.txt b/requirements.txt
+index 1a67e2a..884758f 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -2,3 +2,4 @@ flask>=3.0
+ flask-socketio>=5.3
+ pycaw>=20240210
+ comtypes>=1.4
++requests>=2.31
+diff --git a/server.py b/server.py
+index 813af72..d159c0a 100644
+--- a/server.py
++++ b/server.py
+@@ -1,21 +1,36 @@
+ """
+ Bluetooth Speaker Crossfade Mixer — Backend
+ Flask API + pycaw device enumeration for per-device volume control.
+-Features: crossfade curves, mute, presets, groups, WebSocket, EQ, auto-reconnect.
++Features: crossfade curves, mute, presets, groups, WebSocket, EQ,
++          auto-reconnect, Spotify integration, audio level metering.
+ """
+ 
+ import logging
+ import webbrowser
+ import threading
+ import os
+-from flask import Flask, render_template, jsonify, request
++import time
++import hashlib
++import secrets
++import base64
++import urllib.parse
++from flask import Flask, render_template, jsonify, request, redirect, session
+ from flask_socketio import SocketIO, emit
++import requests as http_requests
+ 
+ # pycaw / COM imports for Windows Core Audio
+ import comtypes
+ from pycaw.pycaw import AudioUtilities
+ from pycaw.constants import EDataFlow, DEVICE_STATE
+ 
++# IAudioMeterInformation for audio level metering
++try:
++    from comtypes import GUID
++    _IID_IAudioMeterInformation = GUID("{C02216F6-8C67-4B5B-9D00-D008E73E0064}")
++    _METER_AVAILABLE = True
++except Exception:
++    _METER_AVAILABLE = False
++
+ # ---------------------------------------------------------------------------
+ # Logging
+ # ---------------------------------------------------------------------------
+@@ -63,6 +78,35 @@ _eq_lock = threading.Lock()
+ _previous_device_ids = set()
+ _prev_lock = threading.Lock()
+ 
++# Audio level cache: {device_id: float (0.0-1.0)}
++_audio_levels = {}
++_levels_lock = threading.Lock()
++
++# ---------------------------------------------------------------------------
++# Spotify state
++# ---------------------------------------------------------------------------
++
++_SPOTIFY_CLIENT_ID = os.environ.get("SPOTIFY_CLIENT_ID", "")
++_SPOTIFY_REDIRECT_URI = "http://127.0.0.1:5123/api/spotify/callback"
++_SPOTIFY_SCOPES = "user-read-playback-state user-modify-playback-state user-read-currently-playing"
++
++_spotify_lock = threading.Lock()
++_spotify_tokens = {
++    "access_token": None,
++    "refresh_token": None,
++    "expires_at": 0,
++    "client_id": "",
++}
++_spotify_now_playing = {
++    "is_playing": False,
++    "track": None,
++    "artist": None,
++    "album": None,
++    "album_art": None,
++    "progress_ms": 0,
++    "duration_ms": 0,
++}
++
+ # ---------------------------------------------------------------------------
+ # Device enumeration helpers
+ # ---------------------------------------------------------------------------
+@@ -275,6 +319,144 @@ def _validate_device_id(device_id):
+     return isinstance(device_id, str) and 0 < len(device_id) <= _MAX_DEVICE_ID_LEN
+ 
+ 
++def get_audio_levels():
++    """Read peak audio levels for all active render devices via IAudioMeterInformation."""
++    levels = {}
++    if not _METER_AVAILABLE:
++        return levels
++
++    try:
++        all_devices = _get_active_render_devices()
++    except Exception:
++        return levels
++
++    for device in all_devices:
++        try:
++            # Activate IAudioMeterInformation on the device endpoint
++            meter = device.EndpointVolume  # fallback — try to get meter info
++            try:
++                endpoint = device._dev
++                meter_info = endpoint.Activate(_IID_IAudioMeterInformation, 0, None)
++                peak = meter_info.GetPeakValue()
++                levels[device.id] = round(max(0.0, min(1.0, peak)), 4)
++            except Exception:
++                levels[device.id] = 0.0
++        except Exception:
++            continue
++
++    with _levels_lock:
++        _audio_levels.clear()
++        _audio_levels.update(levels)
++
++    return levels
++
++
++# ---------------------------------------------------------------------------
++# Spotify helpers
++# ---------------------------------------------------------------------------
++
++
++def _spotify_generate_pkce():
++    """Generate PKCE code verifier and challenge."""
++    verifier = secrets.token_urlsafe(64)[:128]
++    digest = hashlib.sha256(verifier.encode("ascii")).digest()
++    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
++    return verifier, challenge
++
++
++def _spotify_token_valid():
++    """Check if we have a valid (non-expired) Spotify access token."""
++    with _spotify_lock:
++        return (_spotify_tokens["access_token"] is not None
++                and time.time() < _spotify_tokens["expires_at"])
++
++
++def _spotify_refresh():
++    """Refresh the Spotify access token using the refresh token."""
++    with _spotify_lock:
++        refresh_token = _spotify_tokens.get("refresh_token")
++        client_id = _spotify_tokens.get("client_id") or _SPOTIFY_CLIENT_ID
++
++    if not refresh_token or not client_id:
++        return False
++
++    try:
++        resp = http_requests.post("https://accounts.spotify.com/api/token", data={
++            "grant_type": "refresh_token",
++            "refresh_token": refresh_token,
++            "client_id": client_id,
++        }, timeout=10)
++
++        if resp.status_code != 200:
++            log.warning("Spotify token refresh failed: %s", resp.text)
++            return False
++
++        data = resp.json()
++        with _spotify_lock:
++            _spotify_tokens["access_token"] = data["access_token"]
++            _spotify_tokens["expires_at"] = time.time() + data.get("expires_in", 3600) - 60
++            if "refresh_token" in data:
++                _spotify_tokens["refresh_token"] = data["refresh_token"]
++        return True
++    except Exception as exc:
++        log.error("Spotify refresh error: %s", exc)
++        return False
++
++
++def _spotify_get_headers():
++    """Return Authorization header dict, refreshing token if needed."""
++    if not _spotify_token_valid():
++        _spotify_refresh()
++    with _spotify_lock:
++        token = _spotify_tokens.get("access_token")
++    if not token:
++        return None
++    return {"Authorization": f"Bearer {token}"}
++
++
++def _spotify_poll_now_playing():
++    """Poll Spotify for the current playback state."""
++    headers = _spotify_get_headers()
++    if not headers:
++        return
++
++    try:
++        resp = http_requests.get(
++            "https://api.spotify.com/v1/me/player/currently-playing",
++            headers=headers, timeout=5)
++
++        if resp.status_code == 204 or resp.status_code == 401:
++            with _spotify_lock:
++                _spotify_now_playing["is_playing"] = False
++                _spotify_now_playing["track"] = None
++            return
++
++        if resp.status_code != 200:
++            return
++
++        data = resp.json()
++        item = data.get("item")
++        if not item:
++            return
++
++        artists = ", ".join(a["name"] for a in item.get("artists", []))
++        images = item.get("album", {}).get("images", [])
++        art_url = images[0]["url"] if images else None
++
++        with _spotify_lock:
++            _spotify_now_playing.update({
++                "is_playing": data.get("is_playing", False),
++                "track": item.get("name"),
++                "artist": artists,
++                "album": item.get("album", {}).get("name"),
++                "album_art": art_url,
++                "progress_ms": data.get("progress_ms", 0),
++                "duration_ms": item.get("duration_ms", 0),
++            })
++    except Exception as exc:
++        log.error("Spotify poll error: %s", exc)
++
++
+ # ---------------------------------------------------------------------------
+ # Flask routes
+ # ---------------------------------------------------------------------------
+@@ -504,6 +686,175 @@ def api_eq_get(device_id):
+     return jsonify(eq)
+ 
+ 
++# ---------------------------------------------------------------------------
++# Spotify API routes
++# ---------------------------------------------------------------------------
++
++
++@app.route("/api/spotify/login")
++def api_spotify_login():
++    """Initiate Spotify OAuth 2.0 PKCE login flow."""
++    client_id = request.args.get("client_id", "").strip() or _SPOTIFY_CLIENT_ID
++    if not client_id:
++        return jsonify({"success": False, "error": "No Spotify client_id provided. Set SPOTIFY_CLIENT_ID env var or pass ?client_id=..."}), 400
++
++    verifier, challenge = _spotify_generate_pkce()
++    # Store PKCE verifier and client_id in server-side session
++    session["spotify_pkce_verifier"] = verifier
++    session["spotify_client_id"] = client_id
++
++    params = urllib.parse.urlencode({
++        "response_type": "code",
++        "client_id": client_id,
++        "scope": _SPOTIFY_SCOPES,
++        "redirect_uri": _SPOTIFY_REDIRECT_URI,
++        "code_challenge_method": "S256",
++        "code_challenge": challenge,
++    })
++    return redirect(f"https://accounts.spotify.com/authorize?{params}")
++
++
++@app.route("/api/spotify/callback")
++def api_spotify_callback():
++    """Handle Spotify OAuth callback — exchange code for tokens."""
++    code = request.args.get("code")
++    error = request.args.get("error")
++
++    if error:
++        return f"<h2>Spotify auth error: {error}</h2><p><a href='/'>Back to mixer</a></p>", 400
++
++    if not code:
++        return "<h2>Missing authorization code</h2><p><a href='/'>Back to mixer</a></p>", 400
++
++    verifier = session.get("spotify_pkce_verifier")
++    client_id = session.get("spotify_client_id", _SPOTIFY_CLIENT_ID)
++
++    if not verifier:
++        return "<h2>Session expired — please login again</h2><p><a href='/'>Back to mixer</a></p>", 400
++
++    try:
++        resp = http_requests.post("https://accounts.spotify.com/api/token", data={
++            "grant_type": "authorization_code",
++            "code": code,
++            "redirect_uri": _SPOTIFY_REDIRECT_URI,
++            "client_id": client_id,
++            "code_verifier": verifier,
++        }, timeout=10)
++
++        if resp.status_code != 200:
++            log.warning("Spotify token exchange failed: %s", resp.text)
++            return f"<h2>Token exchange failed</h2><pre>{resp.text}</pre><p><a href='/'>Back to mixer</a></p>", 400
++
++        data = resp.json()
++        with _spotify_lock:
++            _spotify_tokens["access_token"] = data["access_token"]
++            _spotify_tokens["refresh_token"] = data.get("refresh_token")
++            _spotify_tokens["expires_at"] = time.time() + data.get("expires_in", 3600) - 60
++            _spotify_tokens["client_id"] = client_id
++
++        log.info("Spotify authenticated successfully")
++        # Redirect back to the mixer UI
++        return redirect("/")
++
++    except Exception as exc:
++        log.error("Spotify callback error: %s", exc)
++        return f"<h2>Error: {exc}</h2><p><a href='/'>Back to mixer</a></p>", 500
++
++
++@app.route("/api/spotify/status")
++def api_spotify_status():
++    """Return Spotify connection status."""
++    connected = _spotify_token_valid()
++    with _spotify_lock:
++        np = dict(_spotify_now_playing) if connected else {}
++    return jsonify({"connected": connected, "now_playing": np})
++
++
++@app.route("/api/spotify/now-playing")
++def api_spotify_now_playing():
++    """Return current Spotify now-playing info."""
++    with _spotify_lock:
++        return jsonify(_spotify_now_playing)
++
++
++@app.route("/api/spotify/play", methods=["POST"])
++def api_spotify_play():
++    """Resume Spotify playback."""
++    headers = _spotify_get_headers()
++    if not headers:
++        return jsonify({"success": False, "error": "Not connected to Spotify"}), 401
++    try:
++        resp = http_requests.put("https://api.spotify.com/v1/me/player/play",
++                                  headers=headers, timeout=5)
++        return jsonify({"success": resp.status_code in (200, 204)})
++    except Exception as exc:
++        return jsonify({"success": False, "error": str(exc)}), 500
++
++
++@app.route("/api/spotify/pause", methods=["POST"])
++def api_spotify_pause():
++    """Pause Spotify playback."""
++    headers = _spotify_get_headers()
++    if not headers:
++        return jsonify({"success": False, "error": "Not connected to Spotify"}), 401
++    try:
++        resp = http_requests.put("https://api.spotify.com/v1/me/player/pause",
++                                  headers=headers, timeout=5)
++        return jsonify({"success": resp.status_code in (200, 204)})
++    except Exception as exc:
++        return jsonify({"success": False, "error": str(exc)}), 500
++
++
++@app.route("/api/spotify/next", methods=["POST"])
++def api_spotify_next():
++    """Skip to next track."""
++    headers = _spotify_get_headers()
++    if not headers:
++        return jsonify({"success": False, "error": "Not connected to Spotify"}), 401
++    try:
++        resp = http_requests.post("https://api.spotify.com/v1/me/player/next",
++                                   headers=headers, timeout=5)
++        return jsonify({"success": resp.status_code in (200, 204)})
++    except Exception as exc:
++        return jsonify({"success": False, "error": str(exc)}), 500
++
++
++@app.route("/api/spotify/previous", methods=["POST"])
++def api_spotify_previous():
++    """Skip to previous track."""
++    headers = _spotify_get_headers()
++    if not headers:
++        return jsonify({"success": False, "error": "Not connected to Spotify"}), 401
++    try:
++        resp = http_requests.post("https://api.spotify.com/v1/me/player/previous",
++                                   headers=headers, timeout=5)
++        return jsonify({"success": resp.status_code in (200, 204)})
++    except Exception as exc:
++        return jsonify({"success": False, "error": str(exc)}), 500
++
++
++@app.route("/api/spotify/disconnect", methods=["POST"])
++def api_spotify_disconnect():
++    """Disconnect from Spotify (clear tokens)."""
++    with _spotify_lock:
++        _spotify_tokens["access_token"] = None
++        _spotify_tokens["refresh_token"] = None
++        _spotify_tokens["expires_at"] = 0
++    return jsonify({"success": True})
++
++
++# ---------------------------------------------------------------------------
++# Audio Levels API
++# ---------------------------------------------------------------------------
++
++
++@app.route("/api/levels")
++def api_levels():
++    """Return current peak audio levels for all devices."""
++    with _levels_lock:
++        return jsonify(_audio_levels)
++
++
+ # ---------------------------------------------------------------------------
+ # WebSocket events
+ # ---------------------------------------------------------------------------
+@@ -576,6 +927,37 @@ def _device_monitor():
+         socketio.sleep(_monitor_interval)
+ 
+ 
++def _audio_level_monitor():
++    """Push per-device audio levels via WebSocket at ~10fps."""
++    while True:
++        try:
++            levels = get_audio_levels()
++            if levels:
++                socketio.emit("audio_levels", levels)
++        except Exception as exc:
++            log.error("Audio level monitor error: %s", exc)
++        socketio.sleep(0.1)  # ~10fps
++
++
++def _spotify_monitor():
++    """Poll Spotify now-playing and push updates via WebSocket."""
++    prev_track = None
++    while True:
++        try:
++            if _spotify_token_valid():
++                _spotify_poll_now_playing()
++                with _spotify_lock:
++                    np = dict(_spotify_now_playing)
++                # Only emit when something changes
++                track_key = (np.get("track"), np.get("artist"), np.get("is_playing"))
++                if track_key != prev_track:
++                    prev_track = track_key
++                    socketio.emit("spotify_now_playing", np)
++        except Exception as exc:
++            log.error("Spotify monitor error: %s", exc)
++        socketio.sleep(3.0)
++
++
+ # ---------------------------------------------------------------------------
+ # Application entry point
+ # ---------------------------------------------------------------------------
+@@ -587,8 +969,10 @@ if __name__ == "__main__":
+ 
+     log.info("Starting Bluetooth Crossfade Mixer server at %s", url)
+ 
+-    # Start background device monitor
++    # Start background monitors
+     socketio.start_background_task(_device_monitor)
++    socketio.start_background_task(_audio_level_monitor)
++    socketio.start_background_task(_spotify_monitor)
+ 
+     # Open the browser after a short delay so the server is ready.
+     threading.Timer(1.5, lambda: webbrowser.open(url)).start()
+diff --git a/templates/index.html b/templates/index.html
+index 5272ce5..1593cc4 100644
+--- a/templates/index.html
++++ b/templates/index.html
+@@ -200,6 +200,99 @@
+     position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+     overflow: hidden; clip: rect(0,0,0,0); border: 0;
+   }
++
++  /* Spotify panel */
++  .spotify-bar {
++    margin-top: 12px;
++    display: flex;
++    align-items: center;
++    gap: 10px;
++    background: #16213e;
++    border: 1px solid #0f3460;
++    border-radius: 8px;
++    padding: 8px 14px;
++    max-width: 560px;
++    width: 100%;
++    min-height: 56px;
++  }
++  .spotify-bar.hidden { display: none; }
++  .spotify-art {
++    width: 44px; height: 44px;
++    border-radius: 4px;
++    object-fit: cover;
++    flex-shrink: 0;
++    background: #1a1a2e;
++  }
++  .spotify-info {
++    flex: 1;
++    min-width: 0;
++    overflow: hidden;
++  }
++  .spotify-track {
++    font-size: 0.82rem;
++    color: #fff;
++    white-space: nowrap;
++    overflow: hidden;
++    text-overflow: ellipsis;
++  }
++  .spotify-artist {
++    font-size: 0.72rem;
++    color: #888;
++    white-space: nowrap;
++    overflow: hidden;
++    text-overflow: ellipsis;
++  }
++  .spotify-progress-bar {
++    width: 100%;
++    height: 3px;
++    background: #0f3460;
++    border-radius: 2px;
++    margin-top: 4px;
++    overflow: hidden;
++  }
++  .spotify-progress-fill {
++    height: 100%;
++    background: #1db954;
++    border-radius: 2px;
++    transition: width 1s linear;
++  }
++  .spotify-controls {
++    display: flex;
++    gap: 4px;
++    flex-shrink: 0;
++  }
++  .spotify-controls button {
++    background: transparent;
++    border: 1px solid #0f3460;
++    color: #ccc;
++    width: 30px; height: 30px;
++    border-radius: 50%;
++    font-size: 0.85rem;
++    padding: 0;
++    display: flex;
++    align-items: center;
++    justify-content: center;
++    cursor: pointer;
++    transition: background 0.2s, color 0.2s;
++  }
++  .spotify-controls button:hover { background: #0f3460; color: #1db954; }
++  .spotify-connect-btn {
++    background: #1db954 !important;
++    color: #fff !important;
++    border-color: #1db954 !important;
++    border-radius: 6px !important;
++    width: auto !important;
++    padding: 6px 12px !important;
++    font-size: 0.78rem !important;
++  }
++  .spotify-connect-btn:hover { background: #1ed760 !important; }
++  .spotify-disconnect {
++    font-size: 0.7rem;
++    color: #666;
++    cursor: pointer;
++    margin-left: 4px;
++  }
++  .spotify-disconnect:hover { color: #ff6b6b; }
+ </style>
+ </head>
+ <body>
+@@ -224,6 +317,32 @@
+   <button id="btnCenterReset" aria-label="Reset control point to center">Center</button>
+ </div>
+ 
++<!-- Spotify Now Playing Bar -->
++<div id="spotifyBar" class="spotify-bar hidden">
++  <img id="spotifyArt" class="spotify-art" src="" alt="Album art">
++  <div class="spotify-info">
++    <div id="spotifyTrack" class="spotify-track">Not playing</div>
++    <div id="spotifyArtist" class="spotify-artist"></div>
++    <div class="spotify-progress-bar">
++      <div id="spotifyProgress" class="spotify-progress-fill" style="width: 0%"></div>
++    </div>
++  </div>
++  <div class="spotify-controls" id="spotifyControls">
++    <button id="btnSpotifyPrev" title="Previous track">&#9664;&#9664;</button>
++    <button id="btnSpotifyPlay" title="Play/Pause">&#9654;</button>
++    <button id="btnSpotifyNext" title="Next track">&#9654;&#9654;</button>
++  </div>
++  <span id="btnSpotifyDisconnect" class="spotify-disconnect" title="Disconnect Spotify">&#10005;</span>
++</div>
++
++<!-- Spotify Connect (shown when not connected) -->
++<div id="spotifyConnect" class="spotify-bar">
++  <div class="spotify-info">
++    <div class="spotify-track" style="color: #888; font-size: 0.78rem;">Connect Spotify for now-playing display & playback controls</div>
++  </div>
++  <button id="btnSpotifyConnect" class="spotify-connect-btn" title="Connect to Spotify">Connect Spotify</button>
++</div>
++
+ <div id="statusBar" class="status-bar">
+   <span class="ws-indicator disconnected" id="wsIndicator"></span>
+   Connecting...
+@@ -632,6 +751,17 @@
+       const vol = d.displayVol;
+       const isFocused = idx === state.focusedDeviceIndex;
+ 
++      // Audio level ring (outer pulsing ring showing real-time audio)
++      const level = audioLevels[d.id] || 0;
++      if (level > 0.01 && !isMuted) {
++        const levelRadius = NODE_RADIUS + 4 + level * 18;
++        ctx.beginPath();
++        ctx.arc(d.x, d.y, levelRadius, 0, Math.PI * 2);
++        ctx.strokeStyle = `rgba(29, 185, 84, ${0.3 + level * 0.5})`;
++        ctx.lineWidth = 2 + level * 3;
++        ctx.stroke();
++      }
++
+       // Glow
+       if (vol > 0.01 && !isMuted) {
+         const grad = ctx.createRadialGradient(d.x, d.y, NODE_RADIUS * 0.5, d.x, d.y, NODE_RADIUS * 2 + vol * 20);
+@@ -1208,6 +1338,98 @@
+     } catch { /* ignore */ }
+   });
+ 
++  // -----------------------------------------------------------------------
++  // Audio Level Visualization
++  // -----------------------------------------------------------------------
++  const audioLevels = {};  // device_id -> current level (0.0-1.0)
++
++  if (socket) {
++    socket.on("audio_levels", (levels) => {
++      for (const [id, level] of Object.entries(levels)) {
++        audioLevels[id] = level;
++      }
++    });
++
++    socket.on("spotify_now_playing", (np) => {
++      updateSpotifyUI(np);
++    });
++  }
++
++  // -----------------------------------------------------------------------
++  // Spotify UI
++  // -----------------------------------------------------------------------
++  const spotifyBar = document.getElementById("spotifyBar");
++  const spotifyConnect = document.getElementById("spotifyConnect");
++  const spotifyTrack = document.getElementById("spotifyTrack");
++  const spotifyArtist = document.getElementById("spotifyArtist");
++  const spotifyArt = document.getElementById("spotifyArt");
++  const spotifyProgress = document.getElementById("spotifyProgress");
++  const btnSpotifyPlay = document.getElementById("btnSpotifyPlay");
++  let spotifyPlaying = false;
++
++  function updateSpotifyUI(np) {
++    if (!np || !np.track) {
++      spotifyBar.classList.add("hidden");
++      spotifyConnect.classList.remove("hidden");
++      return;
++    }
++    spotifyBar.classList.remove("hidden");
++    spotifyConnect.classList.add("hidden");
++
++    spotifyTrack.textContent = np.track || "Unknown";
++    spotifyArtist.textContent = np.artist || "";
++    spotifyPlaying = np.is_playing;
++    btnSpotifyPlay.innerHTML = np.is_playing ? "&#9646;&#9646;" : "&#9654;";
++    btnSpotifyPlay.title = np.is_playing ? "Pause" : "Play";
++
++    if (np.album_art) {
++      spotifyArt.src = np.album_art;
++      spotifyArt.style.display = "";
++    } else {
++      spotifyArt.style.display = "none";
++    }
++
++    if (np.duration_ms > 0) {
++      const pct = Math.min(100, (np.progress_ms / np.duration_ms) * 100);
++      spotifyProgress.style.width = pct + "%";
++    }
++  }
++
++  // Spotify connect button
++  document.getElementById("btnSpotifyConnect").addEventListener("click", () => {
++    const clientId = prompt("Enter your Spotify Client ID:\n(Create one at https://developer.spotify.com/dashboard)");
++    if (clientId && clientId.trim()) {
++      window.location.href = "/api/spotify/login?client_id=" + encodeURIComponent(clientId.trim());
++    }
++  });
++
++  // Spotify playback controls
++  btnSpotifyPlay.addEventListener("click", async () => {
++    const endpoint = spotifyPlaying ? "/api/spotify/pause" : "/api/spotify/play";
++    try { await fetch(endpoint, { method: "POST" }); } catch { /* ignore */ }
++  });
++
++  document.getElementById("btnSpotifyPrev").addEventListener("click", async () => {
++    try { await fetch("/api/spotify/previous", { method: "POST" }); } catch { /* ignore */ }
++  });
++
++  document.getElementById("btnSpotifyNext").addEventListener("click", async () => {
++    try { await fetch("/api/spotify/next", { method: "POST" }); } catch { /* ignore */ }
++  });
++
++  document.getElementById("btnSpotifyDisconnect").addEventListener("click", async () => {
++    try { await fetch("/api/spotify/disconnect", { method: "POST" }); } catch { /* ignore */ }
++    spotifyBar.classList.add("hidden");
++    spotifyConnect.classList.remove("hidden");
++  });
++
++  // Check Spotify status on load
++  fetch("/api/spotify/status").then(r => r.json()).then(data => {
++    if (data.connected && data.now_playing) {
++      updateSpotifyUI(data.now_playing);
++    }
++  }).catch(() => {});
++
+   // -----------------------------------------------------------------------
+   // Main loop
+   // -----------------------------------------------------------------------
+diff --git a/test_server.py b/test_server.py
+index 31b6437..5daa983 100644
+--- a/test_server.py
++++ b/test_server.py
+@@ -411,5 +411,138 @@ class TestValidateDeviceId(unittest.TestCase):
+         self.assertFalse(server._validate_device_id(None))
+ 
+ 
++class TestSpotifyAPI(unittest.TestCase):
++    def setUp(self):
++        server.app.testing = True
++        server.app.config["SECRET_KEY"] = "test-secret"
++        self.client = server.app.test_client()
++        # Reset Spotify state
++        with server._spotify_lock:
++            server._spotify_tokens["access_token"] = None
++            server._spotify_tokens["refresh_token"] = None
++            server._spotify_tokens["expires_at"] = 0
++            server._spotify_tokens["client_id"] = ""
++
++    def test_spotify_status_disconnected(self):
++        resp = self.client.get("/api/spotify/status")
++        self.assertEqual(resp.status_code, 200)
++        data = json.loads(resp.data)
++        self.assertFalse(data["connected"])
++
++    def test_spotify_status_connected(self):
++        import time
++        with server._spotify_lock:
++            server._spotify_tokens["access_token"] = "test_token"
++            server._spotify_tokens["expires_at"] = time.time() + 3600
++        resp = self.client.get("/api/spotify/status")
++        data = json.loads(resp.data)
++        self.assertTrue(data["connected"])
++
++    def test_spotify_now_playing_default(self):
++        resp = self.client.get("/api/spotify/now-playing")
++        self.assertEqual(resp.status_code, 200)
++        data = json.loads(resp.data)
++        self.assertFalse(data["is_playing"])
++
++    def test_spotify_play_unauthorized(self):
++        resp = self.client.post("/api/spotify/play")
++        self.assertEqual(resp.status_code, 401)
++
++    def test_spotify_pause_unauthorized(self):
++        resp = self.client.post("/api/spotify/pause")
++        self.assertEqual(resp.status_code, 401)
++
++    def test_spotify_next_unauthorized(self):
++        resp = self.client.post("/api/spotify/next")
++        self.assertEqual(resp.status_code, 401)
++
++    def test_spotify_previous_unauthorized(self):
++        resp = self.client.post("/api/spotify/previous")
++        self.assertEqual(resp.status_code, 401)
++
++    def test_spotify_disconnect(self):
++        import time
++        with server._spotify_lock:
++            server._spotify_tokens["access_token"] = "test_token"
++            server._spotify_tokens["expires_at"] = time.time() + 3600
++        resp = self.client.post("/api/spotify/disconnect")
++        self.assertEqual(resp.status_code, 200)
++        self.assertTrue(json.loads(resp.data)["success"])
++        # Verify tokens cleared
++        with server._spotify_lock:
++            self.assertIsNone(server._spotify_tokens["access_token"])
++
++    def test_spotify_login_no_client_id(self):
++        # No client_id and no env var
++        resp = self.client.get("/api/spotify/login")
++        self.assertEqual(resp.status_code, 400)
++
++    def test_spotify_login_with_client_id(self):
++        resp = self.client.get("/api/spotify/login?client_id=test_client_123")
++        # Should redirect to Spotify authorize page
++        self.assertEqual(resp.status_code, 302)
++        self.assertIn("accounts.spotify.com/authorize", resp.headers["Location"])
++
++    def test_spotify_callback_no_code(self):
++        resp = self.client.get("/api/spotify/callback")
++        self.assertEqual(resp.status_code, 400)
++
++    def test_spotify_callback_error(self):
++        resp = self.client.get("/api/spotify/callback?error=access_denied")
++        self.assertEqual(resp.status_code, 400)
++
++
++class TestAudioLevelsAPI(unittest.TestCase):
++    def setUp(self):
++        server.app.testing = True
++        self.client = server.app.test_client()
++
++    def test_get_levels(self):
++        with server._levels_lock:
++            server._audio_levels.clear()
++            server._audio_levels["dev1"] = 0.5
++        resp = self.client.get("/api/levels")
++        self.assertEqual(resp.status_code, 200)
++        data = json.loads(resp.data)
++        self.assertEqual(data["dev1"], 0.5)
++
++    def test_get_levels_empty(self):
++        with server._levels_lock:
++            server._audio_levels.clear()
++        resp = self.client.get("/api/levels")
++        self.assertEqual(resp.status_code, 200)
++        data = json.loads(resp.data)
++        self.assertEqual(data, {})
++
++
++class TestSpotifyHelpers(unittest.TestCase):
++    def test_pkce_generation(self):
++        verifier, challenge = server._spotify_generate_pkce()
++        self.assertIsInstance(verifier, str)
++        self.assertIsInstance(challenge, str)
++        self.assertGreater(len(verifier), 40)
++        self.assertGreater(len(challenge), 20)
++        # Challenge should not contain padding
++        self.assertNotIn("=", challenge)
++
++    def test_token_valid_when_expired(self):
++        with server._spotify_lock:
++            server._spotify_tokens["access_token"] = "test"
++            server._spotify_tokens["expires_at"] = 0
++        self.assertFalse(server._spotify_token_valid())
++
++    def test_token_valid_when_none(self):
++        with server._spotify_lock:
++            server._spotify_tokens["access_token"] = None
++        self.assertFalse(server._spotify_token_valid())
++
++    def test_token_valid_when_fresh(self):
++        import time
++        with server._spotify_lock:
++            server._spotify_tokens["access_token"] = "test"
++            server._spotify_tokens["expires_at"] = time.time() + 3600
++        self.assertTrue(server._spotify_token_valid())
++
++
+ if __name__ == "__main__":
+     unittest.main()
+-- 
+2.43.0
+
+
+From ab34953e2d0736e16f839849d2ec9ba106c4ae43 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Mar 2026 23:21:37 +0000
+Subject: [PATCH 5/6] fix: security, performance, and correctness optimizations
+
+Security:
+- Fix XSS in Spotify callback by escaping error/resp.text/exc with html.escape()
+
+Performance:
+- Cache device list in audio level monitor (was re-enumerating COM 10x/sec)
+- Convert device_ids to set for O(1) lookup in group creation
+- DRY up 4 repetitive Spotify playback handlers into shared helper
+- Remove dead code (unused `meter` variable in get_audio_levels)
+
+Correctness:
+- Fix race condition: api_spotify_now_playing now copies dict under lock
+- Fix api_groups_list serializing dict under lock (copy first)
+- Move audioLevels declaration near state to avoid fragile ordering
+- Add audio level smoothing (fast attack/slow decay) for natural meters
+- Add Spotify progress bar interpolation between 3s server updates
+- Add Spotify HTTP polling fallback when WebSocket is disconnected
+
+https://claude.ai/code/session_01S7VjSQ7Bf5X2V5UZjp8yoZ
+---
+ server.py            | 105 +++++++++++++++++++++----------------------
+ templates/index.html |  63 +++++++++++++++++++-------
+ 2 files changed, 97 insertions(+), 71 deletions(-)
+
+diff --git a/server.py b/server.py
+index d159c0a..e6f0ba7 100644
+--- a/server.py
++++ b/server.py
+@@ -5,6 +5,7 @@ Features: crossfade curves, mute, presets, groups, WebSocket, EQ,
+           auto-reconnect, Spotify integration, audio level metering.
+ """
+ 
++import html
+ import logging
+ import webbrowser
+ import threading
+@@ -82,6 +83,11 @@ _prev_lock = threading.Lock()
+ _audio_levels = {}
+ _levels_lock = threading.Lock()
+ 
++# Cached device objects for audio metering (avoids re-enumerating COM at 10fps)
++_cached_meter_devices = []
++_cached_meter_ts = 0.0
++_METER_CACHE_TTL = 3.0  # reuse device list for 3 seconds
++
+ # ---------------------------------------------------------------------------
+ # Spotify state
+ # ---------------------------------------------------------------------------
+@@ -320,29 +326,33 @@ def _validate_device_id(device_id):
+ 
+ 
+ def get_audio_levels():
+-    """Read peak audio levels for all active render devices via IAudioMeterInformation."""
++    """Read peak audio levels for all active render devices via IAudioMeterInformation.
++
++    Caches the device list for _METER_CACHE_TTL seconds to avoid
++    re-enumerating COM devices at 10fps.
++    """
++    global _cached_meter_devices, _cached_meter_ts
++
+     levels = {}
+     if not _METER_AVAILABLE:
+         return levels
+ 
+-    try:
+-        all_devices = _get_active_render_devices()
+-    except Exception:
+-        return levels
++    now = time.monotonic()
++    if now - _cached_meter_ts > _METER_CACHE_TTL:
++        try:
++            _cached_meter_devices = _get_active_render_devices()
++            _cached_meter_ts = now
++        except Exception:
++            return levels
+ 
+-    for device in all_devices:
++    for device in _cached_meter_devices:
+         try:
+-            # Activate IAudioMeterInformation on the device endpoint
+-            meter = device.EndpointVolume  # fallback — try to get meter info
+-            try:
+-                endpoint = device._dev
+-                meter_info = endpoint.Activate(_IID_IAudioMeterInformation, 0, None)
+-                peak = meter_info.GetPeakValue()
+-                levels[device.id] = round(max(0.0, min(1.0, peak)), 4)
+-            except Exception:
+-                levels[device.id] = 0.0
++            endpoint = device._dev
++            meter_info = endpoint.Activate(_IID_IAudioMeterInformation, 0, None)
++            peak = meter_info.GetPeakValue()
++            levels[device.id] = round(max(0.0, min(1.0, peak)), 4)
+         except Exception:
+-            continue
++            levels[device.id] = 0.0
+ 
+     with _levels_lock:
+         _audio_levels.clear()
+@@ -583,7 +593,8 @@ def api_mute():
+ def api_groups_list():
+     """Return all device groups."""
+     with _groups_lock:
+-        return jsonify(_device_groups)
++        groups_copy = dict(_device_groups)
++    return jsonify(groups_copy)
+ 
+ 
+ @app.route("/api/groups", methods=["POST"])
+@@ -611,12 +622,14 @@ def api_groups_create():
+ 
+     name = name.strip()
+ 
++    device_ids_set = set(device_ids)
++
+     with _groups_lock:
+         if name not in _device_groups and len(_device_groups) >= _MAX_GROUPS:
+             return jsonify({"success": False, "error": "Maximum group limit reached"}), 400
+-        # Remove these devices from any other groups
++        # Remove these devices from any other groups (O(n) with set lookup)
+         for gname in list(_device_groups.keys()):
+-            _device_groups[gname] = [d for d in _device_groups[gname] if d not in device_ids]
++            _device_groups[gname] = [d for d in _device_groups[gname] if d not in device_ids_set]
+             if not _device_groups[gname]:
+                 del _device_groups[gname]
+         if device_ids:
+@@ -721,7 +734,7 @@ def api_spotify_callback():
+     error = request.args.get("error")
+ 
+     if error:
+-        return f"<h2>Spotify auth error: {error}</h2><p><a href='/'>Back to mixer</a></p>", 400
++        return f"<h2>Spotify auth error: {html.escape(error)}</h2><p><a href='/'>Back to mixer</a></p>", 400
+ 
+     if not code:
+         return "<h2>Missing authorization code</h2><p><a href='/'>Back to mixer</a></p>", 400
+@@ -743,7 +756,7 @@ def api_spotify_callback():
+ 
+         if resp.status_code != 200:
+             log.warning("Spotify token exchange failed: %s", resp.text)
+-            return f"<h2>Token exchange failed</h2><pre>{resp.text}</pre><p><a href='/'>Back to mixer</a></p>", 400
++            return f"<h2>Token exchange failed</h2><pre>{html.escape(resp.text)}</pre><p><a href='/'>Back to mixer</a></p>", 400
+ 
+         data = resp.json()
+         with _spotify_lock:
+@@ -758,7 +771,7 @@ def api_spotify_callback():
+ 
+     except Exception as exc:
+         log.error("Spotify callback error: %s", exc)
+-        return f"<h2>Error: {exc}</h2><p><a href='/'>Back to mixer</a></p>", 500
++        return f"<h2>Error: {html.escape(str(exc))}</h2><p><a href='/'>Back to mixer</a></p>", 500
+ 
+ 
+ @app.route("/api/spotify/status")
+@@ -774,63 +787,45 @@ def api_spotify_status():
+ def api_spotify_now_playing():
+     """Return current Spotify now-playing info."""
+     with _spotify_lock:
+-        return jsonify(_spotify_now_playing)
++        np_copy = dict(_spotify_now_playing)
++    return jsonify(np_copy)
+ 
+ 
+-@app.route("/api/spotify/play", methods=["POST"])
+-def api_spotify_play():
+-    """Resume Spotify playback."""
++def _spotify_playback_action(method, endpoint_path):
++    """Shared handler for Spotify playback control endpoints."""
+     headers = _spotify_get_headers()
+     if not headers:
+         return jsonify({"success": False, "error": "Not connected to Spotify"}), 401
+     try:
+-        resp = http_requests.put("https://api.spotify.com/v1/me/player/play",
+-                                  headers=headers, timeout=5)
++        url = f"https://api.spotify.com/v1/me/player/{endpoint_path}"
++        resp = getattr(http_requests, method)(url, headers=headers, timeout=5)
+         return jsonify({"success": resp.status_code in (200, 204)})
+     except Exception as exc:
+         return jsonify({"success": False, "error": str(exc)}), 500
+ 
+ 
++@app.route("/api/spotify/play", methods=["POST"])
++def api_spotify_play():
++    """Resume Spotify playback."""
++    return _spotify_playback_action("put", "play")
++
++
+ @app.route("/api/spotify/pause", methods=["POST"])
+ def api_spotify_pause():
+     """Pause Spotify playback."""
+-    headers = _spotify_get_headers()
+-    if not headers:
+-        return jsonify({"success": False, "error": "Not connected to Spotify"}), 401
+-    try:
+-        resp = http_requests.put("https://api.spotify.com/v1/me/player/pause",
+-                                  headers=headers, timeout=5)
+-        return jsonify({"success": resp.status_code in (200, 204)})
+-    except Exception as exc:
+-        return jsonify({"success": False, "error": str(exc)}), 500
++    return _spotify_playback_action("put", "pause")
+ 
+ 
+ @app.route("/api/spotify/next", methods=["POST"])
+ def api_spotify_next():
+     """Skip to next track."""
+-    headers = _spotify_get_headers()
+-    if not headers:
+-        return jsonify({"success": False, "error": "Not connected to Spotify"}), 401
+-    try:
+-        resp = http_requests.post("https://api.spotify.com/v1/me/player/next",
+-                                   headers=headers, timeout=5)
+-        return jsonify({"success": resp.status_code in (200, 204)})
+-    except Exception as exc:
+-        return jsonify({"success": False, "error": str(exc)}), 500
++    return _spotify_playback_action("post", "next")
+ 
+ 
+ @app.route("/api/spotify/previous", methods=["POST"])
+ def api_spotify_previous():
+     """Skip to previous track."""
+-    headers = _spotify_get_headers()
+-    if not headers:
+-        return jsonify({"success": False, "error": "Not connected to Spotify"}), 401
+-    try:
+-        resp = http_requests.post("https://api.spotify.com/v1/me/player/previous",
+-                                   headers=headers, timeout=5)
+-        return jsonify({"success": resp.status_code in (200, 204)})
+-    except Exception as exc:
+-        return jsonify({"success": False, "error": str(exc)}), 500
++    return _spotify_playback_action("post", "previous")
+ 
+ 
+ @app.route("/api/spotify/disconnect", methods=["POST"])
+diff --git a/templates/index.html b/templates/index.html
+index 1593cc4..e259f25 100644
+--- a/templates/index.html
++++ b/templates/index.html
+@@ -453,6 +453,10 @@
+     focusedDeviceIndex: -1,
+   };
+ 
++  // Audio levels: raw values from server + smoothed display values
++  const audioLevels = {};      // device_id -> raw level (0.0-1.0)
++  const audioLevelsSmooth = {}; // device_id -> smoothed display level
++
+   const statusBar = document.getElementById("statusBar");
+   const ariaLive = document.getElementById("ariaLive");
+ 
+@@ -752,13 +756,19 @@
+       const isFocused = idx === state.focusedDeviceIndex;
+ 
+       // Audio level ring (outer pulsing ring showing real-time audio)
+-      const level = audioLevels[d.id] || 0;
+-      if (level > 0.01 && !isMuted) {
+-        const levelRadius = NODE_RADIUS + 4 + level * 18;
++      const rawLevel = audioLevels[d.id] || 0;
++      const prevSmooth = audioLevelsSmooth[d.id] || 0;
++      // Fast attack, slow decay for natural-looking meters
++      const smoothed = rawLevel > prevSmooth
++        ? lerp(prevSmooth, rawLevel, 0.4)
++        : lerp(prevSmooth, rawLevel, 0.12);
++      audioLevelsSmooth[d.id] = smoothed;
++      if (smoothed > 0.01 && !isMuted) {
++        const levelRadius = NODE_RADIUS + 4 + smoothed * 18;
+         ctx.beginPath();
+         ctx.arc(d.x, d.y, levelRadius, 0, Math.PI * 2);
+-        ctx.strokeStyle = `rgba(29, 185, 84, ${0.3 + level * 0.5})`;
+-        ctx.lineWidth = 2 + level * 3;
++        ctx.strokeStyle = `rgba(29, 185, 84, ${0.3 + smoothed * 0.5})`;
++        ctx.lineWidth = 2 + smoothed * 3;
+         ctx.stroke();
+       }
+ 
+@@ -1339,10 +1349,8 @@
+   });
+ 
+   // -----------------------------------------------------------------------
+-  // Audio Level Visualization
++  // Audio Level & Spotify WebSocket listeners
+   // -----------------------------------------------------------------------
+-  const audioLevels = {};  // device_id -> current level (0.0-1.0)
+-
+   if (socket) {
+     socket.on("audio_levels", (levels) => {
+       for (const [id, level] of Object.entries(levels)) {
+@@ -1366,6 +1374,9 @@
+   const spotifyProgress = document.getElementById("spotifyProgress");
+   const btnSpotifyPlay = document.getElementById("btnSpotifyPlay");
+   let spotifyPlaying = false;
++  let spotifyProgressMs = 0;
++  let spotifyDurationMs = 0;
++  let spotifyLastUpdateTs = 0;
+ 
+   function updateSpotifyUI(np) {
+     if (!np || !np.track) {
+@@ -1389,12 +1400,26 @@
+       spotifyArt.style.display = "none";
+     }
+ 
+-    if (np.duration_ms > 0) {
+-      const pct = Math.min(100, (np.progress_ms / np.duration_ms) * 100);
++    // Store for local interpolation
++    spotifyProgressMs = np.progress_ms || 0;
++    spotifyDurationMs = np.duration_ms || 0;
++    spotifyLastUpdateTs = Date.now();
++
++    if (spotifyDurationMs > 0) {
++      const pct = Math.min(100, (spotifyProgressMs / spotifyDurationMs) * 100);
+       spotifyProgress.style.width = pct + "%";
+     }
+   }
+ 
++  // Interpolate Spotify progress bar locally (smooth between 3s server updates)
++  setInterval(() => {
++    if (!spotifyPlaying || spotifyDurationMs <= 0) return;
++    const elapsed = Date.now() - spotifyLastUpdateTs;
++    const currentMs = Math.min(spotifyDurationMs, spotifyProgressMs + elapsed);
++    const pct = Math.min(100, (currentMs / spotifyDurationMs) * 100);
++    spotifyProgress.style.width = pct + "%";
++  }, 500);
++
+   // Spotify connect button
+   document.getElementById("btnSpotifyConnect").addEventListener("click", () => {
+     const clientId = prompt("Enter your Spotify Client ID:\n(Create one at https://developer.spotify.com/dashboard)");
+@@ -1423,12 +1448,18 @@
+     spotifyConnect.classList.remove("hidden");
+   });
+ 
+-  // Check Spotify status on load
+-  fetch("/api/spotify/status").then(r => r.json()).then(data => {
+-    if (data.connected && data.now_playing) {
+-      updateSpotifyUI(data.now_playing);
+-    }
+-  }).catch(() => {});
++  // Check Spotify status on load and poll as HTTP fallback
++  function fetchSpotifyStatus() {
++    fetch("/api/spotify/status").then(r => r.json()).then(data => {
++      if (data.connected && data.now_playing) {
++        updateSpotifyUI(data.now_playing);
++      }
++    }).catch(() => {});
++  }
++  fetchSpotifyStatus();
++  setInterval(() => {
++    if (!socket || !socket.connected) fetchSpotifyStatus();
++  }, 5000);
+ 
+   // -----------------------------------------------------------------------
+   // Main loop
+-- 
+2.43.0
+
+
+From a72e972eaf1f2f86aee13517e28574c4416f27df Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Mar 2026 23:29:53 +0000
+Subject: [PATCH 6/6] Suppress pycaw COMError warning spam in terminal
+
+Filter out harmless UserWarning messages from pycaw when it tries to
+read optional properties from audio devices that don't support them.
+
+https://claude.ai/code/session_01S7VjSQ7Bf5X2V5UZjp8yoZ
+---
+ server.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/server.py b/server.py
+index e6f0ba7..c3c9a12 100644
+--- a/server.py
++++ b/server.py
+@@ -7,6 +7,10 @@ Features: crossfade curves, mute, presets, groups, WebSocket, EQ,
+ 
+ import html
+ import logging
++import warnings
++
++# Suppress pycaw COMError warnings when reading optional device properties
++warnings.filterwarnings("ignore", message="COMError", category=UserWarning, module="pycaw")
+ import webbrowser
+ import threading
+ import os
+-- 
+2.43.0
+
