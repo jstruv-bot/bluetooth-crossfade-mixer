@@ -1,0 +1,698 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bluetooth Crossfade Mixer</title>
+    <style>
+        /* ── Reset & Base ─────────────────────────────────────── */
+        *, *::before, *::after {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background: #1a1a2e;
+            color: #e0e0e0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                         Helvetica, Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+            padding: 2rem 1rem;
+        }
+
+        /* ── Header ───────────────────────────────────────────── */
+        h1 {
+            font-size: 1.8rem;
+            font-weight: 600;
+            color: #00d4ff;
+            margin-bottom: 1.5rem;
+            text-align: center;
+            letter-spacing: 0.03em;
+        }
+
+        /* ── Canvas container ─────────────────────────────────── */
+        .canvas-wrap {
+            position: relative;
+            display: flex;
+            justify-content: center;
+        }
+
+        canvas {
+            border-radius: 12px;
+            border: 1px solid rgba(0, 212, 255, 0.15);
+            box-shadow: 0 0 30px rgba(0, 212, 255, 0.08),
+                        0 4px 20px rgba(0, 0, 0, 0.4);
+            background: #0f0f23;
+        }
+
+        /* ── Status bar ───────────────────────────────────────── */
+        .status-bar {
+            margin-top: 1rem;
+            display: flex;
+            align-items: center;
+            gap: 1.2rem;
+            font-size: 0.9rem;
+            color: #8888aa;
+        }
+
+        .status-bar .device-count {
+            color: #00d4ff;
+            font-weight: 600;
+        }
+
+        /* ── Buttons ──────────────────────────────────────────── */
+        button {
+            background: rgba(0, 212, 255, 0.12);
+            color: #00d4ff;
+            border: 1px solid rgba(0, 212, 255, 0.3);
+            padding: 0.5rem 1.2rem;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: background 0.2s, border-color 0.2s;
+        }
+
+        button:hover {
+            background: rgba(0, 212, 255, 0.22);
+            border-color: rgba(0, 212, 255, 0.6);
+        }
+
+        button:active {
+            background: rgba(0, 212, 255, 0.32);
+        }
+
+        /* ── Setup Guide (collapsible) ────────────────────────── */
+        details.setup-guide {
+            margin-top: 2rem;
+            max-width: 500px;
+            width: 100%;
+            border: 1px solid rgba(0, 212, 255, 0.12);
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.02);
+        }
+
+        details.setup-guide summary {
+            cursor: pointer;
+            padding: 0.75rem 1rem;
+            font-weight: 600;
+            color: #00d4ff;
+            font-size: 0.95rem;
+            list-style: none;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            user-select: none;
+        }
+
+        details.setup-guide summary::before {
+            content: "\25B6";
+            font-size: 0.7rem;
+            transition: transform 0.2s;
+        }
+
+        details.setup-guide[open] summary::before {
+            transform: rotate(90deg);
+        }
+
+        /* Remove default marker in webkit browsers */
+        details.setup-guide summary::-webkit-details-marker {
+            display: none;
+        }
+
+        details.setup-guide .guide-content {
+            padding: 0 1rem 1rem;
+            font-size: 0.85rem;
+            line-height: 1.6;
+            color: #b0b0c8;
+        }
+
+        details.setup-guide .guide-content h3 {
+            color: #e0e0e0;
+            font-size: 0.9rem;
+            margin: 1rem 0 0.4rem;
+        }
+
+        details.setup-guide .guide-content h3:first-child {
+            margin-top: 0.2rem;
+        }
+
+        details.setup-guide .guide-content ol {
+            padding-left: 1.4rem;
+        }
+
+        details.setup-guide .guide-content li {
+            margin-bottom: 0.35rem;
+        }
+
+        details.setup-guide .guide-content code {
+            background: rgba(0, 212, 255, 0.08);
+            color: #00d4ff;
+            padding: 0.1em 0.35em;
+            border-radius: 3px;
+            font-size: 0.82rem;
+        }
+
+        details.setup-guide .guide-content .method-divider {
+            border: none;
+            border-top: 1px solid rgba(0, 212, 255, 0.1);
+            margin: 1rem 0;
+        }
+
+        /* ── Error state ─────────────────────────────────────── */
+        .status-error {
+            color: #ff6b6b !important;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>Bluetooth Crossfade Mixer</h1>
+
+    <div class="canvas-wrap">
+        <canvas id="mixer" width="500" height="500"></canvas>
+    </div>
+
+    <div class="status-bar">
+        <span id="status-text">Scanning devices...</span>
+        <button id="btn-refresh" type="button">Refresh Devices</button>
+    </div>
+
+    <details class="setup-guide">
+        <summary>Setup Guide</summary>
+        <div class="guide-content">
+
+            <h3>Method 1 &mdash; Windows "Listen to this device" (Stereo Mix)</h3>
+            <p>This built-in Windows feature lets you mirror audio to a second output
+               without any extra software.</p>
+            <ol>
+                <li>Open <code>Control Panel &gt; Sound</code> (or run <code>mmsys.cpl</code>).</li>
+                <li>Go to the <strong>Recording</strong> tab.</li>
+                <li>Right-click in the empty area and enable <strong>Show Disabled Devices</strong>.</li>
+                <li>Find <strong>Stereo Mix</strong> (or your sound card's loopback device), right-click it, and choose <strong>Enable</strong>.</li>
+                <li>Double-click Stereo Mix to open its properties.</li>
+                <li>Go to the <strong>Listen</strong> tab.</li>
+                <li>Check <strong>Listen to this device</strong>.</li>
+                <li>In the <strong>Playback through this device</strong> dropdown, select your Bluetooth speaker.</li>
+                <li>Click <strong>OK</strong>. Audio from your default device will now also play on the Bluetooth speaker.</li>
+                <li>Repeat for additional speakers, using one Stereo Mix instance per output.</li>
+            </ol>
+
+            <hr class="method-divider">
+
+            <h3>Method 2 &mdash; Voicemeeter (third-party, free)</h3>
+            <p>Voicemeeter is a virtual audio mixer that can route a single audio
+               stream to multiple physical outputs with independent volume control.</p>
+            <ol>
+                <li>Download and install <strong>Voicemeeter</strong> (or Voicemeeter Banana for more channels) from <code>vb-audio.com</code>.</li>
+                <li>Reboot after installation.</li>
+                <li>Open Voicemeeter. Under <strong>Hardware Out</strong> (A1, A2, A3), assign each output to a different playback device (e.g., A1 = laptop speakers, A2 = Bluetooth speaker 1, A3 = Bluetooth speaker 2).</li>
+                <li>In Windows Sound settings, set <strong>Voicemeeter Input</strong> as your default playback device.</li>
+                <li>In Voicemeeter, make sure the input strip routes to A1, A2, and/or A3 by toggling the bus buttons.</li>
+                <li>Adjust each output's fader to control volume independently, or use this mixer for spatial crossfading.</li>
+            </ol>
+        </div>
+    </details>
+
+    <script>
+    /* ==================================================================
+       Bluetooth Crossfade Mixer — Frontend
+       Tasks 4 + 5: HTML shell, radial canvas, device fetching, circle layout
+       ================================================================== */
+
+    // ── Constants ─────────────────────────────────────────────────────
+    const CANVAS_SIZE     = 500;
+    const CENTER          = CANVAS_SIZE / 2;           // 250
+    const RING_RADIUS     = 180;                       // device orbit radius
+    const DEVICE_RADIUS   = 28;                        // device dot size
+    const CONTROL_RADIUS  = 14;                        // draggable control dot size
+    const ACCENT_COLOR    = "#00d4ff";
+    const ACCENT_DIM      = "rgba(0, 212, 255, 0.25)";
+    const BG_COLOR        = "#0f0f23";
+
+    // ── DOM refs ──────────────────────────────────────────────────────
+    const canvas     = document.getElementById("mixer");
+    const ctx        = canvas.getContext("2d");
+    const statusText = document.getElementById("status-text");
+    const btnRefresh = document.getElementById("btn-refresh");
+
+    // ── Application state ─────────────────────────────────────────────
+    const state = {
+        devices:        [],                               // from /api/devices
+        controlPoint:   { x: CENTER, y: CENTER },         // draggable point
+        isDragging:     false,
+        targetVolumes:  {},      // device_id -> calculated volume (0-1)
+        displayVolumes: {},      // device_id -> smoothly-interpolated volume for rendering
+        lastSentVolumes: {}      // device_id -> last volume value sent to API
+    };
+
+    // ── Device-fetching ───────────────────────────────────────────────
+
+    /**
+     * Fetch the device list from the backend, update state, and redraw.
+     */
+    async function fetchDevices() {
+        // Suppress polling during drag to avoid jitter
+        if (state.isDragging) return;
+        try {
+            const res  = await fetch("/api/devices");
+            const data = await res.json();
+            state.devices = data;
+            // Connection restored — clear any error state
+            statusText.classList.remove("status-error");
+        } catch (err) {
+            console.error("Failed to fetch devices:", err);
+            statusText.innerHTML = "Connection lost &mdash; retrying\u2026";
+            statusText.classList.add("status-error");
+            return;   // skip updateStatusBar / updateVolumes on error
+        }
+        updateStatusBar();
+        updateVolumes();
+    }
+
+    /**
+     * Force a re-scan on the backend, then update state and redraw.
+     */
+    async function refreshDevices() {
+        try {
+            const res  = await fetch("/api/refresh", { method: "POST" });
+            const data = await res.json();
+            state.devices = data;
+        } catch (err) {
+            console.error("Failed to refresh devices:", err);
+        }
+        updateStatusBar();
+        updateVolumes();
+    }
+
+    /**
+     * Update the status bar text with the current device count.
+     */
+    function updateStatusBar() {
+        const n = state.devices.length;
+        if (n === 0) {
+            statusText.innerHTML = "No speakers detected";
+        } else {
+            statusText.innerHTML =
+                '<span class="device-count">' + n + "</span> " +
+                "speaker" + (n !== 1 ? "s" : "") + " connected";
+        }
+    }
+
+    // ── Geometry helpers ──────────────────────────────────────────────
+
+    /**
+     * Compute the canvas position of the i-th device in a ring of n devices.
+     * Devices are evenly spaced; the first device sits at the top (12 o'clock).
+     *
+     * @param {number} i  Zero-based device index.
+     * @param {number} n  Total number of devices.
+     * @returns {{x: number, y: number}}
+     */
+    function devicePosition(i, n) {
+        // Start at -PI/2 so the first device is at the top.
+        const angle = (i * 2 * Math.PI) / n - Math.PI / 2;
+        return {
+            x: CENTER + RING_RADIUS * Math.cos(angle),
+            y: CENTER + RING_RADIUS * Math.sin(angle)
+        };
+    }
+
+    // ── Volume calculation ────────────────────────────────────────────
+
+    /**
+     * Compute crossfade volumes based on control point proximity to each device.
+     * Uses inverse-square weighting.  Sends updates to the backend (throttled).
+     */
+    function updateVolumes() {
+        const n = state.devices.length;
+        if (n === 0) return;
+
+        const EPSILON = 100;       // prevent division by zero
+        const weights = [];
+
+        // 1. Compute raw inverse-square weights
+        for (let i = 0; i < n; i++) {
+            const pos  = devicePosition(i, n);
+            const dx   = state.controlPoint.x - pos.x;
+            const dy   = state.controlPoint.y - pos.y;
+            const dist2 = dx * dx + dy * dy;
+            weights.push(1 / (dist2 + EPSILON));
+        }
+
+        // 2. Normalize so the max weight becomes 1.0
+        const maxWeight = Math.max(...weights);
+        for (let i = 0; i < n; i++) {
+            let vol = weights[i] / maxWeight;
+            // Apply minimum threshold
+            if (vol < 0.02) vol = 0;
+            state.targetVolumes[state.devices[i].id] = vol;
+        }
+
+        // 3. Send to backend (throttled — only if delta > 0.01)
+        for (let i = 0; i < n; i++) {
+            const id  = state.devices[i].id;
+            const vol = state.targetVolumes[id];
+            const last = state.lastSentVolumes[id];
+            if (last === undefined || Math.abs(vol - last) > 0.01) {
+                state.lastSentVolumes[id] = vol;
+                sendVolume(id, vol);
+            }
+        }
+    }
+
+    /**
+     * Fire-and-forget POST to set a device's volume on the backend.
+     */
+    function sendVolume(deviceId, volume) {
+        fetch("/api/volume", {
+            method:  "POST",
+            headers: { "Content-Type": "application/json" },
+            body:    JSON.stringify({ device_id: deviceId, volume: volume })
+        }).catch(err => console.error("Failed to send volume:", err));
+    }
+
+    // ── Drawing ───────────────────────────────────────────────────────
+
+    /**
+     * Main render function.  Clears the canvas and redraws everything:
+     *   1. Background
+     *   2. Mixer ring (circle boundary)
+     *   3. Devices arranged evenly on the ring
+     *   4. Control point in the centre (draggable)
+     *   5. "No speakers" text when empty
+     */
+    function drawMixer() {
+        // 1. Clear
+        ctx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+        ctx.fillStyle = BG_COLOR;
+        ctx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+
+        // 2. Mixer ring
+        ctx.beginPath();
+        ctx.arc(CENTER, CENTER, RING_RADIUS, 0, Math.PI * 2);
+        ctx.strokeStyle = ACCENT_DIM;
+        ctx.lineWidth   = 1;
+        ctx.stroke();
+
+        // Inner subtle radial glow
+        const ringGlow = ctx.createRadialGradient(
+            CENTER, CENTER, RING_RADIUS - 40,
+            CENTER, CENTER, RING_RADIUS + 10
+        );
+        ringGlow.addColorStop(0, "rgba(0, 212, 255, 0.0)");
+        ringGlow.addColorStop(1, "rgba(0, 212, 255, 0.04)");
+        ctx.beginPath();
+        ctx.arc(CENTER, CENTER, RING_RADIUS, 0, Math.PI * 2);
+        ctx.fillStyle = ringGlow;
+        ctx.fill();
+
+        const n = state.devices.length;
+
+        if (n === 0) {
+            // 5. No-device message
+            ctx.fillStyle = "#555570";
+            ctx.font      = "16px sans-serif";
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.fillText("No speakers detected", CENTER, CENTER);
+            return;                             // nothing else to draw
+        }
+
+        // 3. Draw devices
+        for (let i = 0; i < n; i++) {
+            const pos    = devicePosition(i, n);
+            const device = state.devices[i];
+            const id     = device.id;
+
+            // Smoothed display volume for this device (0 if not yet computed)
+            const dv = state.displayVolumes[id] || 0;
+
+            // Check if device is unavailable/disconnected
+            const unavailable = (device.status && device.status !== "connected" && device.status !== "active");
+
+            if (unavailable) {
+                // ── Unavailable device: grey, no glow, "N/A" ──
+
+                // Connection line — dim grey
+                ctx.beginPath();
+                ctx.moveTo(state.controlPoint.x, state.controlPoint.y);
+                ctx.lineTo(pos.x, pos.y);
+                ctx.strokeStyle = "rgba(100, 100, 120, 0.15)";
+                ctx.lineWidth   = 1;
+                ctx.stroke();
+
+                // Device circle — grey fill
+                ctx.beginPath();
+                ctx.arc(pos.x, pos.y, DEVICE_RADIUS, 0, Math.PI * 2);
+                ctx.fillStyle   = "rgba(100, 100, 120, 0.12)";
+                ctx.strokeStyle = "#555570";
+                ctx.lineWidth   = 1.5;
+                ctx.fill();
+                ctx.stroke();
+
+                // "N/A" text
+                ctx.fillStyle    = "#555570";
+                ctx.font         = "bold 11px sans-serif";
+                ctx.textAlign    = "center";
+                ctx.textBaseline = "middle";
+                ctx.fillText("N/A", pos.x, pos.y);
+
+            } else {
+                // ── Active device: volume-dependent rendering ──
+
+                // Connection line — opacity proportional to volume
+                const lineAlpha = 0.05 + dv * 0.35;    // range ~0.05 to 0.40
+                ctx.beginPath();
+                ctx.moveTo(state.controlPoint.x, state.controlPoint.y);
+                ctx.lineTo(pos.x, pos.y);
+                ctx.strokeStyle = "rgba(0, 212, 255, " + lineAlpha.toFixed(3) + ")";
+                ctx.lineWidth   = 1 + dv * 1.5;        // thicker when louder
+                ctx.stroke();
+
+                // Device circle — outer glow scales with volume
+                const glowIntensity = 0.03 + dv * 0.30;  // 0.03..0.33
+                const glowRadius    = DEVICE_RADIUS * (1.0 + 0.6 * dv); // grows with volume
+                const glow = ctx.createRadialGradient(
+                    pos.x, pos.y, DEVICE_RADIUS * 0.3,
+                    pos.x, pos.y, glowRadius
+                );
+                glow.addColorStop(0, "rgba(0, 212, 255, " + glowIntensity.toFixed(3) + ")");
+                glow.addColorStop(1, "rgba(0, 212, 255, 0.0)");
+                ctx.beginPath();
+                ctx.arc(pos.x, pos.y, glowRadius, 0, Math.PI * 2);
+                ctx.fillStyle = glow;
+                ctx.fill();
+
+                // Device circle — fill
+                ctx.beginPath();
+                ctx.arc(pos.x, pos.y, DEVICE_RADIUS, 0, Math.PI * 2);
+                ctx.fillStyle   = "rgba(0, 212, 255, " + (0.08 + dv * 0.14).toFixed(3) + ")";
+                ctx.strokeStyle = ACCENT_COLOR;
+                ctx.lineWidth   = 1.5;
+                ctx.fill();
+                ctx.stroke();
+
+                // Volume arc indicator (uses calculated crossfade volume, not API volume)
+                const vol = dv;
+                if (vol > 0.005) {
+                    const startAngle = -Math.PI / 2;
+                    const endAngle   = startAngle + vol * 2 * Math.PI;
+                    ctx.beginPath();
+                    ctx.arc(pos.x, pos.y, DEVICE_RADIUS - 4, startAngle, endAngle);
+                    ctx.strokeStyle = ACCENT_COLOR;
+                    ctx.lineWidth   = 2.5;
+                    ctx.lineCap     = "round";
+                    ctx.stroke();
+                    ctx.lineCap     = "butt";       // reset
+                }
+
+                // Volume percentage text inside the device node
+                const pct = Math.round(dv * 100);
+                ctx.fillStyle    = "#ffffff";
+                ctx.font         = "bold 11px sans-serif";
+                ctx.textAlign    = "center";
+                ctx.textBaseline = "middle";
+                ctx.fillText(pct + "%", pos.x, pos.y);
+            }
+
+            // Device name label (always shown)
+            ctx.fillStyle    = unavailable ? "#555570" : "#c0c0d8";
+            ctx.font         = "11px sans-serif";
+            ctx.textAlign    = "center";
+            ctx.textBaseline = "top";
+
+            // Truncate long names
+            let label = device.name;
+            if (label.length > 18) {
+                label = label.substring(0, 16) + "\u2026";
+            }
+            ctx.fillText(label, pos.x, pos.y + DEVICE_RADIUS + 6);
+        }
+
+        // 4. Control point (draggable dot)
+        drawControlPoint();
+    }
+
+    /**
+     * Draw the control point indicator.
+     * Separated so it can be redrawn independently during drag (future Task 6).
+     */
+    function drawControlPoint() {
+        const cp = state.controlPoint;
+
+        // Outer glow
+        const glow = ctx.createRadialGradient(
+            cp.x, cp.y, 0,
+            cp.x, cp.y, CONTROL_RADIUS * 2.5
+        );
+        glow.addColorStop(0, "rgba(0, 212, 255, 0.25)");
+        glow.addColorStop(1, "rgba(0, 212, 255, 0.0)");
+        ctx.beginPath();
+        ctx.arc(cp.x, cp.y, CONTROL_RADIUS * 2.5, 0, Math.PI * 2);
+        ctx.fillStyle = glow;
+        ctx.fill();
+
+        // Solid circle
+        ctx.beginPath();
+        ctx.arc(cp.x, cp.y, CONTROL_RADIUS, 0, Math.PI * 2);
+        ctx.fillStyle   = ACCENT_COLOR;
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth   = 2;
+        ctx.fill();
+        ctx.stroke();
+
+        // Small inner dot for visual refinement
+        ctx.beginPath();
+        ctx.arc(cp.x, cp.y, 3, 0, Math.PI * 2);
+        ctx.fillStyle = "#ffffff";
+        ctx.fill();
+    }
+
+    // ── Event wiring ──────────────────────────────────────────────────
+
+    btnRefresh.addEventListener("click", refreshDevices);
+
+    // ── Drag event handlers ────────────────────────────────────────────
+
+    /**
+     * Convert a mouse or touch event to canvas-relative coordinates.
+     */
+    function canvasCoords(e) {
+        const rect = canvas.getBoundingClientRect();
+        const scaleX = CANVAS_SIZE / rect.width;
+        const scaleY = CANVAS_SIZE / rect.height;
+        let clientX, clientY;
+        if (e.touches && e.touches.length > 0) {
+            clientX = e.touches[0].clientX;
+            clientY = e.touches[0].clientY;
+        } else {
+            clientX = e.clientX;
+            clientY = e.clientY;
+        }
+        return {
+            x: (clientX - rect.left) * scaleX,
+            y: (clientY - rect.top)  * scaleY
+        };
+    }
+
+    /**
+     * Clamp the control point within the mixer ring boundary.
+     */
+    function clampToRing(x, y) {
+        const dx   = x - CENTER;
+        const dy   = y - CENTER;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        const maxR = RING_RADIUS - CONTROL_RADIUS;   // keep inside the ring
+        if (dist > maxR) {
+            const scale = maxR / dist;
+            return { x: CENTER + dx * scale, y: CENTER + dy * scale };
+        }
+        return { x: x, y: y };
+    }
+
+    function onPointerDown(e) {
+        const p  = canvasCoords(e);
+        const dx = p.x - state.controlPoint.x;
+        const dy = p.y - state.controlPoint.y;
+        if (Math.sqrt(dx * dx + dy * dy) < 20) {
+            state.isDragging = true;
+            e.preventDefault();
+        }
+    }
+
+    function onPointerMove(e) {
+        if (!state.isDragging) return;
+        e.preventDefault();
+        const p      = canvasCoords(e);
+        const clamped = clampToRing(p.x, p.y);
+        state.controlPoint.x = clamped.x;
+        state.controlPoint.y = clamped.y;
+        updateVolumes();
+    }
+
+    function onPointerUp() {
+        state.isDragging = false;
+    }
+
+    canvas.addEventListener("mousedown",  onPointerDown);
+    canvas.addEventListener("mousemove",  onPointerMove);
+    canvas.addEventListener("mouseup",    onPointerUp);
+    canvas.addEventListener("mouseleave", onPointerUp);
+
+    canvas.addEventListener("touchstart", onPointerDown, { passive: false });
+    canvas.addEventListener("touchmove",  onPointerMove, { passive: false });
+    canvas.addEventListener("touchend",   onPointerUp);
+    canvas.addEventListener("touchcancel", onPointerUp);
+
+    // ── Animation loop ─────────────────────────────────────────────────
+
+    const LERP_FACTOR = 0.15;
+
+    /**
+     * Continuous animation loop:
+     * - Interpolates displayVolumes toward targetVolumes (smooth transitions)
+     * - Redraws the mixer every frame
+     */
+    function animationLoop() {
+        // Lerp display volumes toward target volumes
+        for (const id in state.targetVolumes) {
+            const target  = state.targetVolumes[id];
+            const current = state.displayVolumes[id] || 0;
+            if (Math.abs(target - current) > 0.001) {
+                state.displayVolumes[id] = current + (target - current) * LERP_FACTOR;
+            } else {
+                state.displayVolumes[id] = target;
+            }
+        }
+        // Also fade out devices that are no longer in targetVolumes
+        for (const id in state.displayVolumes) {
+            if (!(id in state.targetVolumes)) {
+                state.displayVolumes[id] *= (1 - LERP_FACTOR);
+                if (state.displayVolumes[id] < 0.001) {
+                    delete state.displayVolumes[id];
+                }
+            }
+        }
+
+        drawMixer();
+        requestAnimationFrame(animationLoop);
+    }
+
+    // ── Initialization ────────────────────────────────────────────────
+
+    // Initial fetch on page load, then compute initial volumes.
+    fetchDevices().then(() => updateVolumes());
+
+    // Poll for device changes every 5 seconds.
+    setInterval(fetchDevices, 5000);
+
+    // Start the continuous animation loop.
+    requestAnimationFrame(animationLoop);
+
+    </script>
+</body>
+</html>

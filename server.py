@@ -3,21 +3,32 @@ Bluetooth Speaker Crossfade Mixer — Backend
 Flask API + pycaw device enumeration for per-device volume control.
 """
 
+import sys
+import os
 import webbrowser
 import threading
 from flask import Flask, render_template, jsonify, request
 
 # pycaw / COM imports for Windows Core Audio
 import comtypes
-from comtypes import CLSCTX_ALL
-from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-from pycaw.constants import EDataFlow, DEVICE_STATE
+from pycaw.pycaw import AudioUtilities
+
+
+def get_base_dir():
+    """Get the base directory - works both in dev and when frozen by PyInstaller."""
+    if getattr(sys, 'frozen', False):
+        # Running as PyInstaller bundle
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+BASE_DIR = get_base_dir()
 
 # ---------------------------------------------------------------------------
 # Flask app setup
 # ---------------------------------------------------------------------------
 
-app = Flask(__name__, template_folder="templates")
+app = Flask(__name__, template_folder=os.path.join(BASE_DIR, "templates"))
 
 # ---------------------------------------------------------------------------
 # Device enumeration helpers
@@ -45,11 +56,7 @@ def get_bluetooth_speakers():
     devices_info = []
 
     try:
-        # Request only active render (playback) devices from the enumerator.
-        all_devices = AudioUtilities.GetAllDevices(
-            data_flow=EDataFlow.eRender.value,
-            device_state=DEVICE_STATE.ACTIVE.value,
-        )
+        all_devices = AudioUtilities.GetAllDevices()
     except Exception as exc:
         print(f"[enumerate] Failed to list devices: {exc}")
         return devices_info
